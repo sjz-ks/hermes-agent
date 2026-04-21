@@ -164,6 +164,12 @@ def test_transform_tool_result_integration_with_real_plugin(monkeypatch, tmp_pat
     import yaml
 
     hermes_home = Path(os.environ["HERMES_HOME"])
+    (hermes_home / "config.yaml").write_text(
+        "plugins:\n"
+        "  enabled:\n"
+        "    - transform_result_canon\n",
+        encoding="utf-8",
+    )
     plugins_dir = hermes_home / "plugins"
     plugin_dir = plugins_dir / "transform_result_canon"
     plugin_dir.mkdir(parents=True)
@@ -191,3 +197,34 @@ def test_transform_tool_result_integration_with_real_plugin(monkeypatch, tmp_pat
         dispatch_result='{"payload": 42}',
     )
     assert out == 'CANON[some_tool]{"payload": 42}'
+
+
+def test_transform_tool_result_disable_prompt_affecting_surfaces_blocks_real_plugin(monkeypatch, tmp_path):
+    hermes_home = Path(os.environ["HERMES_HOME"])
+    (hermes_home / "config.yaml").write_text(
+        "plugins:\n"
+        "  enabled:\n"
+        "    - transform_result_canon\n"
+        "  disable_prompt_affecting_surfaces: true\n",
+        encoding="utf-8",
+    )
+    plugins_dir = hermes_home / "plugins"
+    plugin_dir = plugins_dir / "transform_result_canon"
+    plugin_dir.mkdir(parents=True)
+    (plugin_dir / "plugin.yaml").write_text("name: transform_result_canon\n", encoding="utf-8")
+    (plugin_dir / "__init__.py").write_text(
+        "def register(ctx):\n"
+        '    ctx.register_hook("transform_tool_result", '
+        'lambda **kw: f\'CANON[{kw["tool_name"]}]\' + kw["result"])\n',
+        encoding="utf-8",
+    )
+
+    plugins_mod._plugin_manager = plugins_mod.PluginManager()
+    plugins_mod.discover_plugins()
+
+    out = _run_handle_function_call(
+        monkeypatch,
+        tool_name="some_tool",
+        dispatch_result='{"payload": 42}',
+    )
+    assert out == '{"payload": 42}'

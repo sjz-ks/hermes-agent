@@ -705,6 +705,12 @@ DEFAULT_CONFIG = {
         "external_dirs": [],   # e.g. ["~/.agents/skills", "/shared/team-skills"]
     },
 
+    # Plugin host policy. Plugins remain opt-in via plugins.enabled; this
+    # switch only controls whether prompt-affecting plugin surfaces are active.
+    "plugins": {
+        "disable_prompt_affecting_surfaces": False,
+    },
+
     # Honcho AI-native memory -- reads ~/.honcho/config.json as single source of truth.
     # This section is only needed for hermes-specific overrides; everything else
     # (apiKey, workspace, peerName, sessions, enabled) comes from the global config.
@@ -849,7 +855,7 @@ DEFAULT_CONFIG = {
     },
 
     # Config schema version - bump this when adding new required fields
-    "_config_version": 21,
+    "_config_version": 22,
 }
 
 # =============================================================================
@@ -2612,6 +2618,22 @@ def migrate_config(interactive: bool = True, quiet: bool = False) -> Dict[str, A
                         "  ✓ Plugins now opt-in: no existing plugins to grandfather. "
                         "Use `hermes plugins enable <name>` to activate."
                     )
+
+    # ── Version 21 → 22: add prompt-affecting plugin surface host policy ──
+    # Default false preserves existing plugin behavior while giving hosts a
+    # coarse toggle for prompt-affecting plugin surfaces.
+    if current_ver < 22:
+        config = read_raw_config()
+        plugins_cfg = config.get("plugins")
+        if not isinstance(plugins_cfg, dict):
+            plugins_cfg = {}
+        if "disable_prompt_affecting_surfaces" not in plugins_cfg:
+            plugins_cfg["disable_prompt_affecting_surfaces"] = False
+            config["plugins"] = plugins_cfg
+            save_config(config)
+            results["config_added"].append("plugins.disable_prompt_affecting_surfaces")
+            if not quiet:
+                print("  ✓ Added plugins.disable_prompt_affecting_surfaces = false")
 
     if current_ver < latest_ver and not quiet:
         print(f"Config version: {current_ver} → {latest_ver}")

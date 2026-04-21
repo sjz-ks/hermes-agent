@@ -1926,6 +1926,72 @@ class TestRunConversation:
         assert all("message_count" in c and "messages" not in c for c in pre_request_calls)
         assert all("usage" in c and "response" not in c for c in post_request_calls)
 
+    def test_post_llm_call_gets_isolated_conversation_history_copy_when_surfaces_disabled(self, agent):
+        self._setup_agent(agent)
+        resp = _mock_response(content="Final answer", finish_reason="stop")
+        agent.client.chat.completions.create.return_value = resp
+
+        def _mutate_post_hook(name, **kwargs):
+            if name == "post_llm_call":
+                history = kwargs["conversation_history"]
+                history[0]["content"] = "mutated user message"
+                history.append({"role": "user", "content": "injected by hook"})
+            return []
+
+        with (
+            patch("hermes_cli.plugins.invoke_hook", side_effect=_mutate_post_hook),
+            patch(
+                "hermes_cli.plugins._prompt_affecting_surfaces_disabled",
+                return_value=True,
+            ),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("hello")
+
+        assert result["final_response"] == "Final answer"
+        assert result["messages"][0]["role"] == "user"
+        assert result["messages"][0]["content"] == "hello"
+        assert result["messages"][-1]["role"] == "assistant"
+        assert result["messages"][-1]["content"] == "Final answer"
+        assert all(
+            msg.get("content") != "injected by hook" for msg in result["messages"]
+        )
+
+    def test_post_llm_call_retains_legacy_shallow_copy_when_surfaces_enabled(self, agent):
+        self._setup_agent(agent)
+        resp = _mock_response(content="Final answer", finish_reason="stop")
+        agent.client.chat.completions.create.return_value = resp
+
+        def _mutate_post_hook(name, **kwargs):
+            if name == "post_llm_call":
+                history = kwargs["conversation_history"]
+                history[0]["content"] = "mutated user message"
+                history.append({"role": "user", "content": "injected by hook"})
+            return []
+
+        with (
+            patch("hermes_cli.plugins.invoke_hook", side_effect=_mutate_post_hook),
+            patch(
+                "hermes_cli.plugins._prompt_affecting_surfaces_disabled",
+                return_value=False,
+            ),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("hello")
+
+        assert result["final_response"] == "Final answer"
+        assert result["messages"][0]["role"] == "user"
+        assert result["messages"][0]["content"] == "mutated user message"
+        assert result["messages"][-1]["role"] == "assistant"
+        assert result["messages"][-1]["content"] == "Final answer"
+        assert all(
+            msg.get("content") != "injected by hook" for msg in result["messages"]
+        )
+
     def test_content_with_tool_calls_stays_silent_for_non_cli_quiet_mode(self, agent):
         self._setup_agent(agent)
         agent.platform = None

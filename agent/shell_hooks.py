@@ -458,6 +458,7 @@ def _make_callback(spec: ShellHookSpec) -> Callable[..., Optional[Dict[str, Any]
 
     _callback.__name__ = f"shell_hook[{spec.event}:{spec.command}]"
     _callback.__qualname__ = _callback.__name__
+    _callback._hermes_shell_hook = True  # type: ignore[attr-defined]
     return _callback
 
 

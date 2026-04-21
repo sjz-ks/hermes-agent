@@ -635,6 +635,35 @@ class TestDiscordChannelPromptsConfig:
         assert raw["discord"]["channel_prompts"] == {}
 
 
+class TestPluginPromptAffectingSurfaceConfig:
+    def test_default_config_includes_disable_prompt_affecting_surfaces(self):
+        assert DEFAULT_CONFIG["plugins"]["disable_prompt_affecting_surfaces"] is False
+
+    def test_migrate_adds_disable_prompt_affecting_surfaces_without_changing_plugin_lists(self, tmp_path):
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text(
+            yaml.safe_dump(
+                {
+                    "_config_version": 21,
+                    "plugins": {
+                        "enabled": ["demo-plugin"],
+                        "disabled": ["other-plugin"],
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+            migrate_config(interactive=False, quiet=True)
+            raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+
+        assert raw["_config_version"] == DEFAULT_CONFIG["_config_version"]
+        assert raw["plugins"]["enabled"] == ["demo-plugin"]
+        assert raw["plugins"]["disabled"] == ["other-plugin"]
+        assert raw["plugins"]["disable_prompt_affecting_surfaces"] is False
+
+
 class TestUserMessagePreviewConfig:
     def test_default_config_preview_line_counts(self):
         preview = DEFAULT_CONFIG["display"]["user_message_preview"]

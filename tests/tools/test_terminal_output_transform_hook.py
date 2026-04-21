@@ -176,6 +176,12 @@ def test_terminal_output_transform_integration_with_real_plugin(monkeypatch, tmp
     import yaml
 
     hermes_home = Path(os.environ["HERMES_HOME"])
+    (hermes_home / "config.yaml").write_text(
+        "plugins:\n"
+        "  enabled:\n"
+        "    - terminal_transform\n",
+        encoding="utf-8",
+    )
     plugins_dir = hermes_home / "plugins"
     plugin_dir = plugins_dir / "terminal_transform"
     plugin_dir.mkdir(parents=True)
@@ -207,3 +213,35 @@ def test_terminal_output_transform_integration_with_real_plugin(monkeypatch, tmp
     assert "PLUGIN-HEAD" in result["output"]
     assert "PLUGIN-TAIL" in result["output"]
     assert "[OUTPUT TRUNCATED" in result["output"]
+
+
+def test_terminal_output_transform_disable_prompt_affecting_surfaces_blocks_real_plugin(monkeypatch, tmp_path):
+    hermes_home = Path(os.environ["HERMES_HOME"])
+    (hermes_home / "config.yaml").write_text(
+        "plugins:\n"
+        "  enabled:\n"
+        "    - terminal_transform\n"
+        "  disable_prompt_affecting_surfaces: true\n",
+        encoding="utf-8",
+    )
+    plugins_dir = hermes_home / "plugins"
+    plugin_dir = plugins_dir / "terminal_transform"
+    plugin_dir.mkdir(parents=True)
+    (plugin_dir / "plugin.yaml").write_text("name: terminal_transform\n", encoding="utf-8")
+    (plugin_dir / "__init__.py").write_text(
+        "def register(ctx):\n"
+        '    ctx.register_hook("transform_terminal_output", '
+        'lambda **kw: "PLUGIN-HEAD\\n" + kw["output"] + "\\nPLUGIN-TAIL")\n',
+        encoding="utf-8",
+    )
+
+    plugins_mod._plugin_manager = plugins_mod.PluginManager()
+    plugins_mod.discover_plugins()
+
+    result, _mock_env = _run_terminal(
+        monkeypatch,
+        tmp_path,
+        output="plain output",
+    )
+
+    assert result["output"] == "plain output"

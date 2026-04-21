@@ -2,9 +2,11 @@
 
 import logging
 import os
+import queue
 import sys
 import types
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -397,6 +399,216 @@ class TestPluginHooks:
 
         assert any("on_banana" in record.message for record in caplog.records)
 
+    def test_pre_llm_call_not_blocked_when_prompt_affecting_surfaces_enabled(self, monkeypatch):
+        mgr = PluginManager()
+        seen = []
+        mgr._hooks["pre_llm_call"] = [
+            lambda **kw: seen.append(kw["user_message"]) or {"context": "plugin-memory"}
+        ]
+        monkeypatch.setattr(
+            "hermes_cli.plugins._prompt_affecting_surfaces_disabled",
+            lambda: False,
+        )
+
+        results = mgr.invoke_hook(
+            "pre_llm_call",
+            session_id="s1",
+            user_message="hi",
+            conversation_history=[],
+            is_first_turn=True,
+            model="test",
+        )
+
+        assert results == [{"context": "plugin-memory"}]
+        assert seen == ["hi"]
+
+    @pytest.mark.parametrize(
+        "hook_name,kwargs",
+        [
+            (
+                "pre_tool_call",
+                {
+                    "tool_name": "terminal",
+                    "args": {"command": "echo hi"},
+                    "task_id": "t1",
+                    "session_id": "s1",
+                    "tool_call_id": "tc1",
+                },
+            ),
+            (
+                "pre_llm_call",
+                {
+                    "session_id": "s1",
+                    "user_message": "hi",
+                    "conversation_history": [],
+                    "is_first_turn": True,
+                    "model": "test",
+                },
+            ),
+            (
+                "transform_tool_result",
+                {
+                    "tool_name": "dummy",
+                    "args": {},
+                    "result": '{"ok": true}',
+                    "task_id": "t1",
+                    "session_id": "s1",
+                    "tool_call_id": "tc1",
+                },
+            ),
+            (
+                "transform_terminal_output",
+                {
+                    "command": "echo hi",
+                    "output": "hello",
+                    "returncode": 0,
+                    "task_id": "t1",
+                    "env_type": "local",
+                },
+            ),
+        ],
+    )
+    def test_prompt_affecting_hooks_blocked_when_surfaces_disabled(
+        self, monkeypatch, hook_name, kwargs
+    ):
+        mgr = PluginManager()
+        invoked = []
+        mgr._hooks[hook_name] = [lambda **kw: invoked.append(kw) or "should-not-run"]
+        monkeypatch.setattr(
+            "hermes_cli.plugins._prompt_affecting_surfaces_disabled",
+            lambda: True,
+        )
+
+        results = mgr.invoke_hook(hook_name, **kwargs)
+
+        assert results == []
+        assert invoked == []
+
+    def test_pre_llm_call_shell_hook_still_runs_when_surfaces_disabled(self, monkeypatch):
+        from agent import shell_hooks
+
+        mgr = PluginManager()
+        plugin_seen = []
+        mgr._hooks["pre_llm_call"] = [
+            lambda **kw: plugin_seen.append(kw["user_message"]) or {"context": "plugin-memory"}
+        ]
+
+        shell_cb = shell_hooks._make_callback(
+            shell_hooks.ShellHookSpec(
+                event="pre_llm_call",
+                command="/bin/echo",
+            )
+        )
+        mgr._hooks["pre_llm_call"].append(shell_cb)
+
+        monkeypatch.setattr(
+            shell_hooks,
+            "_spawn",
+            lambda spec, payload: {
+                "error": None,
+                "timed_out": False,
+                "stderr": "",
+                "returncode": 0,
+                "stdout": '{"context": "shell-memory"}',
+                "elapsed_seconds": 0.01,
+            },
+        )
+        monkeypatch.setattr(
+            "hermes_cli.plugins._prompt_affecting_surfaces_disabled",
+            lambda: True,
+        )
+
+        results = mgr.invoke_hook(
+            "pre_llm_call",
+            session_id="s1",
+            user_message="hi",
+            conversation_history=[],
+            is_first_turn=True,
+            model="test",
+        )
+
+        assert results == [{"context": "shell-memory"}]
+        assert plugin_seen == []
+
+    def test_pre_tool_call_shell_hook_still_runs_when_surfaces_disabled(self, monkeypatch):
+        from agent import shell_hooks
+
+        mgr = PluginManager()
+        plugin_seen = []
+        mgr._hooks["pre_tool_call"] = [
+            lambda **kw: plugin_seen.append(kw["args"]["command"]) or {"action": "block", "message": "plugin block"}
+        ]
+
+        shell_cb = shell_hooks._make_callback(
+            shell_hooks.ShellHookSpec(
+                event="pre_tool_call",
+                command="/bin/echo",
+                matcher="terminal",
+            )
+        )
+        mgr._hooks["pre_tool_call"].append(shell_cb)
+
+        monkeypatch.setattr(
+            shell_hooks,
+            "_spawn",
+            lambda spec, payload: {
+                "error": None,
+                "timed_out": False,
+                "stderr": "",
+                "returncode": 0,
+                "stdout": '{"action": "block", "message": "shell block"}',
+                "elapsed_seconds": 0.01,
+            },
+        )
+        monkeypatch.setattr(
+            "hermes_cli.plugins._prompt_affecting_surfaces_disabled",
+            lambda: True,
+        )
+
+        results = mgr.invoke_hook(
+            "pre_tool_call",
+            tool_name="terminal",
+            args={"command": "echo hi"},
+            task_id="t1",
+            session_id="s1",
+            tool_call_id="tc1",
+        )
+
+        assert results == [{"action": "block", "message": "shell block"}]
+        assert plugin_seen == []
+
+    @pytest.mark.parametrize("hook_name", ["post_llm_call", "pre_api_request"])
+    def test_observer_hooks_still_run_when_prompt_affecting_surfaces_disabled(self, monkeypatch, hook_name):
+        mgr = PluginManager()
+        mgr._hooks[hook_name] = [lambda **kw: {"hook": hook_name}]
+        monkeypatch.setattr(
+            "hermes_cli.plugins._prompt_affecting_surfaces_disabled",
+            lambda: True,
+        )
+
+        kwargs = (
+            {
+                "session_id": "s1",
+                "user_message": "hi",
+                "assistant_response": "bye",
+                "model": "test",
+            }
+            if hook_name == "post_llm_call"
+            else {
+                "session_id": "s1",
+                "task_id": "t1",
+                "model": "test",
+                "api_call_count": 1,
+                "message_count": 2,
+                "tool_count": 0,
+                "approx_input_tokens": 10,
+                "request_char_count": 20,
+                "max_tokens": 100,
+            }
+        )
+
+        assert mgr.invoke_hook(hook_name, **kwargs) == [{"hook": hook_name}]
+
 
 class TestPreToolCallBlocking:
     """Tests for the pre_tool_call block directive helper."""
@@ -440,6 +652,73 @@ class TestPreToolCallBlocking:
             ],
         )
         assert get_pre_tool_call_block_message("terminal", {}) == "first blocker"
+
+
+class TestPluginContextMessageInjection:
+    def _make_context(self):
+        mgr = PluginManager()
+        manifest = PluginManifest(name="demo")
+        return PluginContext(manifest, mgr), mgr
+
+    def test_inject_message_idle_cli_still_queues_when_surfaces_enabled(self, monkeypatch):
+        ctx, mgr = self._make_context()
+        cli = SimpleNamespace(
+            _agent_running=False,
+            _pending_input=queue.Queue(),
+            _interrupt_queue=queue.Queue(),
+        )
+        mgr._cli_ref = cli
+        monkeypatch.setattr(
+            "hermes_cli.plugins._prompt_affecting_surfaces_disabled",
+            lambda: False,
+        )
+
+        assert ctx.inject_message("hello") is True
+        assert cli._pending_input.get_nowait() == "hello"
+        assert cli._interrupt_queue.empty()
+
+    def test_inject_message_running_cli_still_interrupts_when_surfaces_enabled(self, monkeypatch):
+        ctx, mgr = self._make_context()
+        cli = SimpleNamespace(
+            _agent_running=True,
+            _pending_input=queue.Queue(),
+            _interrupt_queue=queue.Queue(),
+        )
+        mgr._cli_ref = cli
+        monkeypatch.setattr(
+            "hermes_cli.plugins._prompt_affecting_surfaces_disabled",
+            lambda: False,
+        )
+
+        assert ctx.inject_message("hello") is True
+        assert cli._interrupt_queue.get_nowait() == "hello"
+        assert cli._pending_input.empty()
+
+    def test_inject_message_blocked_when_surfaces_disabled(self, monkeypatch):
+        ctx, mgr = self._make_context()
+        cli = SimpleNamespace(
+            _agent_running=False,
+            _pending_input=queue.Queue(),
+            _interrupt_queue=queue.Queue(),
+        )
+        mgr._cli_ref = cli
+        monkeypatch.setattr(
+            "hermes_cli.plugins._prompt_affecting_surfaces_disabled",
+            lambda: True,
+        )
+
+        assert ctx.inject_message("hello") is False
+        assert cli._pending_input.empty()
+        assert cli._interrupt_queue.empty()
+
+    def test_inject_message_without_cli_ref_keeps_existing_false_behavior(self, monkeypatch):
+        ctx, _mgr = self._make_context()
+        monkeypatch.setattr(
+            "hermes_cli.plugins._prompt_affecting_surfaces_disabled",
+            lambda: True,
+        )
+
+        assert ctx.inject_message("hello") is False
 
 
 # ── TestPluginContext ──────────────────────────────────────────────────────

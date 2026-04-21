@@ -11696,13 +11696,20 @@ class AIAgent:
         # to an external memory system).
         if final_response and not interrupted:
             try:
-                from hermes_cli.plugins import invoke_hook as _invoke_hook
+                from hermes_cli.plugins import (
+                    _prompt_affecting_surfaces_disabled,
+                    invoke_hook as _invoke_hook,
+                )
                 _invoke_hook(
                     "post_llm_call",
                     session_id=self.session_id,
                     user_message=original_user_message,
                     assistant_response=final_response,
-                    conversation_history=list(messages),
+                    conversation_history=(
+                        copy.deepcopy(messages)
+                        if _prompt_affecting_surfaces_disabled()
+                        else list(messages)
+                    ),
                     model=self.model,
                     platform=getattr(self, "platform", None) or "",
                 )

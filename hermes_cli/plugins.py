@@ -77,6 +77,19 @@ ENTRY_POINTS_GROUP = "hermes_agent.plugins"
 
 _NS_PARENT = "hermes_plugins"
 
+_PROMPT_AFFECTING_BLOCKED_HOOKS = frozenset({
+    "pre_tool_call",
+    "pre_llm_call",
+    "transform_terminal_output",
+    "transform_tool_result",
+})
+
+_PROMPT_AFFECTING_SURFACES_DISABLED_CACHE: Dict[str, Any] = {
+    "path": None,
+    "mtime_ns": None,
+    "enabled": False,
+}
+
 
 def _env_enabled(name: str) -> bool:
     """Return True when an env var is set to a truthy opt-in value."""
@@ -127,6 +140,44 @@ def _get_enabled_plugins() -> Optional[set]:
         return set(enabled)
     except Exception:
         return None
+
+
+def _prompt_affecting_surfaces_disabled() -> bool:
+    """Return whether prompt-affecting plugin surfaces are host-disabled.
+
+    Reads the raw config file and caches the result by config-path mtime so
+    hook dispatch does not re-parse YAML on every invoke_hook() call.
+    """
+    try:
+        from hermes_cli.config import get_config_path, read_raw_config
+
+        config_path = get_config_path()
+        cache_path = str(config_path)
+        try:
+            mtime_ns = config_path.stat().st_mtime_ns
+        except FileNotFoundError:
+            mtime_ns = None
+
+        if (
+            _PROMPT_AFFECTING_SURFACES_DISABLED_CACHE["path"] == cache_path
+            and _PROMPT_AFFECTING_SURFACES_DISABLED_CACHE["mtime_ns"] == mtime_ns
+        ):
+            return bool(_PROMPT_AFFECTING_SURFACES_DISABLED_CACHE["enabled"])
+
+        enabled = False
+        if mtime_ns is not None:
+            config = read_raw_config()
+            plugins_cfg = config.get("plugins")
+            if isinstance(plugins_cfg, dict):
+                raw_value = plugins_cfg.get("disable_prompt_affecting_surfaces", False)
+                enabled = raw_value if isinstance(raw_value, bool) else False
+
+        _PROMPT_AFFECTING_SURFACES_DISABLED_CACHE.update(
+            {"path": cache_path, "mtime_ns": mtime_ns, "enabled": enabled}
+        )
+        return enabled
+    except Exception:
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -219,6 +270,15 @@ class PluginContext:
         cli = self._manager._cli_ref
         if cli is None:
             logger.warning("inject_message: no CLI reference (not available in gateway mode)")
+            return False
+
+        if _prompt_affecting_surfaces_disabled():
+            logger.debug(
+                "inject_message blocked by plugins.disable_prompt_affecting_surfaces "
+                "host policy "
+                "for plugin '%s'",
+                self.manifest.name,
+            )
             return False
 
         msg = content if role == "user" else f"[{role}] {content}"
@@ -745,6 +805,24 @@ class PluginManager:
         persisted to session DB.
         """
         callbacks = self._hooks.get(hook_name, [])
+        if not callbacks:
+            return []
+
+        if (
+            hook_name in _PROMPT_AFFECTING_BLOCKED_HOOKS
+            and _prompt_affecting_surfaces_disabled()
+        ):
+            filtered_callbacks = [
+                cb for cb in callbacks if getattr(cb, "_hermes_shell_hook", False)
+            ]
+            if len(filtered_callbacks) != len(callbacks):
+                logger.debug(
+                    "Plugin callbacks for hook '%s' blocked by "
+                    "plugins.disable_prompt_affecting_surfaces host policy",
+                    hook_name,
+                )
+            callbacks = filtered_callbacks
+
         results: List[Any] = []
         for cb in callbacks:
             try:
