@@ -118,6 +118,7 @@ from tools.terminal_tool import (
 from tools.tool_result_storage import maybe_persist_tool_result, enforce_turn_budget
 from tools.interrupt import set_interrupt as _set_interrupt
 from tools.browser_tool import cleanup_browser
+from tools.registry import tool_error
 
 
 # Agent internals extracted to agent/ package for modularity
@@ -127,7 +128,7 @@ from agent.error_classifier import classify_api_error, FailoverReason
 from agent.prompt_builder import (
     DEFAULT_AGENT_IDENTITY, PLATFORM_HINTS,
     MEMORY_GUIDANCE, SESSION_SEARCH_GUIDANCE, SKILLS_GUIDANCE,
-    HERMES_AGENT_HELP_GUIDANCE,
+    STRICT_SKILLS_GUIDANCE, HERMES_AGENT_HELP_GUIDANCE,
     build_nous_subscription_prompt,
 )
 from agent.model_metadata import (
@@ -1003,6 +1004,7 @@ class AIAgent:
         # would mangle the escape sequences.  None = use builtins.print.
         self._print_fn = None
         self.background_review_callback = None  # Optional sync callback for gateway delivery
+        self._is_background_review_agent = False
         self.skip_context_files = skip_context_files
         self.pass_session_id = pass_session_id
         self._credential_pool = credential_pool
@@ -1749,9 +1751,11 @@ class AIAgent:
 
         # Skills config: nudge interval for skill creation reminders
         self._skill_nudge_interval = 10
+        self._strict_skill_creation_mode = False
         try:
             skills_config = _agent_cfg.get("skills", {})
             self._skill_nudge_interval = int(skills_config.get("creation_nudge_interval", 10))
+            self._strict_skill_creation_mode = bool(skills_config.get("strict_creation_mode", False))
         except Exception:
             pass
 
@@ -3254,6 +3258,14 @@ class AIAgent:
         "If nothing stands out, just say 'Nothing to save.' and stop."
     )
 
+    _SKILL_PATCH_REVIEW_PROMPT = (
+        "Review the conversation above and consider whether an existing skill should be updated.\n\n"
+        "Focus on: did a skill prove stale, incomplete, misleading, or missing an important step or pitfall?\n\n"
+        "Inspect existing skills if needed, then patch the relevant one with what you learned. "
+        "Do not create a new skill in this review. "
+        "If nothing needs updating, just say 'Nothing to save.' and stop."
+    )
+
     _COMBINED_REVIEW_PROMPT = (
         "Review the conversation above and consider two things:\n\n"
         "**Memory**: Has the user revealed things about themselves — their persona, "
@@ -3338,11 +3350,487 @@ class AIAgent:
                 actions.append(f"{label} updated")
         return actions
 
+    def _skill_candidate_turn_range(self, messages_snapshot: List[Dict]) -> List[int]:
+        if not messages_snapshot:
+            return []
+        return [0, max(0, len(messages_snapshot) - 1)]
+
+    def _strict_skill_creation_active(self) -> bool:
+        """Strict skill creation is currently supported in terminal frontends."""
+        # TUI now surfaces newly pending proposals via background-review status
+        # prompts, while still reusing the shared /skillreviews approval flow.
+        # It does not yet match the classic CLI's queue polling/re-surfacing UX.
+        return bool(self._strict_skill_creation_mode and self.platform in {"cli", "tui"})
+
+    @staticmethod
+    def _resolve_path_like_file_tool(path: str, task_id: str = "default") -> Path:
+        """Resolve paths with the same base-directory semantics as file tools."""
+        try:
+            from tools.file_tools import _resolve_path_for_task
+
+            return _resolve_path_for_task(path, task_id or "default")
+        except Exception:
+            resolved_path = Path(path).expanduser()
+            if not resolved_path.is_absolute():
+                resolved_path = Path(os.environ.get("TERMINAL_CWD", os.getcwd())) / resolved_path
+            return resolved_path.resolve()
+
+    def _strict_skill_store_write_block_message(
+        self,
+        function_name: str,
+        function_args: Dict[str, Any],
+        task_id: str = "default",
+    ) -> Optional[str]:
+        # Strict creation Phase 1: block Hermes file tools from writing directly into
+        # trusted skill directories (local store plus configured external dirs).
+        # This is not a complete sandbox: terminal, execute_code, plugin tools, or
+        # external processes can still mutate the same directories. A future
+        # post-tool invariant/quarantine pass is required for a hard store-level guarantee.
+        if not self._strict_skill_creation_active() or function_name not in {"write_file", "patch"}:
+            return None
+
+        candidate_paths: list[str] = []
+        if function_name == "write_file":
+            path = str(function_args.get("path") or "").strip()
+            if path:
+                candidate_paths.append(path)
+        elif function_name == "patch":
+            path = str(function_args.get("path") or "").strip()
+            if path:
+                candidate_paths.append(path)
+            patch_content = function_args.get("patch")
+            if isinstance(patch_content, str):
+                for match in re.finditer(
+                    r"^\*\*\*\s*(?:Update|Add|Delete)\s+File:\s*(.+)$",
+                    patch_content,
+                    re.MULTILINE,
+                ):
+                    patch_path = match.group(1).strip()
+                    if patch_path:
+                        candidate_paths.append(patch_path)
+                # Match the V4A parser's permissive "***Move File" spacing.
+                # Either side can directly mutate the trusted skills store.
+                for match in re.finditer(
+                    r"^\*\*\*\s*Move\s+File:\s*(.+?)\s*->\s*(.+)$",
+                    patch_content,
+                    re.MULTILINE,
+                ):
+                    source_path = match.group(1).strip()
+                    destination_path = match.group(2).strip()
+                    if source_path:
+                        candidate_paths.append(source_path)
+                    if destination_path:
+                        candidate_paths.append(destination_path)
+
+        if not candidate_paths:
+            return None
+
+        trusted_skill_dirs: list[Path] = []
+        seen_trusted_dirs: set[str] = set()
+        try:
+            from agent.skill_utils import get_all_skills_dirs
+
+            for skills_dir in get_all_skills_dirs():
+                resolved_dir = Path(skills_dir).expanduser().resolve()
+                key = str(resolved_dir)
+                if key not in seen_trusted_dirs:
+                    trusted_skill_dirs.append(resolved_dir)
+                    seen_trusted_dirs.add(key)
+        except Exception:
+            try:
+                from tools.skill_manager_tool import SKILLS_DIR
+
+                trusted_skill_dirs.append(SKILLS_DIR.resolve())
+            except Exception:
+                return None
+
+        for raw_path in candidate_paths:
+            try:
+                resolved_path = self._resolve_path_like_file_tool(raw_path, task_id)
+            except (OSError, RuntimeError, ValueError):
+                continue
+            for trusted_skills_dir in trusted_skill_dirs:
+                try:
+                    resolved_path.relative_to(trusted_skills_dir)
+                except ValueError:
+                    continue
+                return (
+                    "Direct writes to trusted skill directories are blocked in strict skill creation mode. "
+                    "New skills must use skill_manage(action='create'); existing skill edits must use "
+                    "skill_manage(action='patch'|'edit'|'write_file')."
+                )
+
+        return None
+
+    def _review_skill_candidate(self, candidate_id: str) -> Dict[str, Any]:
+        from agent.skill_admission import run_admission_review
+        from tools.skill_candidate_tool import (
+            DECISION_PROMOTE_NEW,
+            STATUS_REJECTED,
+            STATUS_REVIEWED,
+            update_candidate_review,
+            view_candidate,
+        )
+
+        candidate_result = view_candidate(candidate_id)
+        if not candidate_result.get("success"):
+            return candidate_result
+
+        candidate = candidate_result.get("candidate") or {}
+        verdict = run_admission_review(
+            candidate,
+            main_runtime=self._current_main_runtime(),
+        )
+        status = STATUS_REVIEWED if verdict.get("decision") == DECISION_PROMOTE_NEW else STATUS_REJECTED
+        update_result = update_candidate_review(
+            candidate_id,
+            scores=dict(verdict.get("scores") or {}),
+            total_score=int(verdict.get("total_score") or 0),
+            threshold_used=int(verdict.get("threshold_used") or 0),
+            decision=str(verdict.get("decision") or ""),
+            decision_reason=str(verdict.get("decision_reason") or ""),
+            summary_for_user=str(verdict.get("summary_for_user") or ""),
+            target_skill=str(verdict.get("target_skill") or ""),
+            status=status,
+        )
+        if not update_result.get("success"):
+            return update_result
+        return {
+            "success": True,
+            "candidate_id": candidate_id,
+            "decision": verdict.get("decision"),
+            "decision_reason": verdict.get("decision_reason", ""),
+            "summary_for_user": verdict.get("summary_for_user", ""),
+            "scores": verdict.get("scores", {}),
+            "total_score": verdict.get("total_score", 0),
+            "threshold_used": verdict.get("threshold_used", 0),
+        }
+
+    def _stage_skill_candidate(
+        self,
+        *,
+        name: str,
+        content: str,
+        category: Optional[str] = None,
+        scope: str,
+        why_created: str,
+        verification_summary: str,
+        origin: str,
+        reusability_rationale: Optional[str] = None,
+        known_limits: Optional[str] = None,
+        source_session_id: Optional[str] = None,
+        source_turn_range: Optional[List[int]] = None,
+        tool_calls: Optional[List[str]] = None,
+        commands_run: Optional[List[str]] = None,
+        tests_run: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
+        from tools.skill_candidate_tool import create_candidate
+
+        return create_candidate(
+            name=name,
+            content=content,
+            category=category,
+            scope=scope,
+            why_created=why_created,
+            verification_summary=verification_summary,
+            origin=origin,
+            reusability_rationale=reusability_rationale,
+            known_limits=known_limits,
+            source_session_id=source_session_id,
+            source_turn_range=source_turn_range,
+            tool_calls=tool_calls,
+            commands_run=commands_run,
+            tests_run=tests_run,
+        )
+
+    def _create_user_requested_skill_candidate(
+        self,
+        *,
+        name: str,
+        content: str,
+        category: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        from tools.skill_candidate_tool import (
+            DECISION_PROMOTE_NEW,
+            ORIGIN_USER_REQUESTED,
+            STATUS_REVIEWED,
+            delete_candidate,
+            update_candidate_review,
+        )
+
+        create_result = self._stage_skill_candidate(
+            name=name,
+            content=content,
+            category=category,
+            scope="general",
+            why_created="Captured from an explicit skill save request while strict creation mode is enabled.",
+            verification_summary=(
+                "This proposal came from an explicit skill save request and still requires user review before promotion."
+            ),
+            origin=ORIGIN_USER_REQUESTED,
+            reusability_rationale=None,
+            known_limits=None,
+            source_session_id=self.session_id,
+            source_turn_range=None,
+            tool_calls=[],
+            commands_run=[],
+            tests_run=[],
+        )
+        if not create_result.get("success"):
+            return create_result
+
+        candidate_id = str(create_result.get("candidate_id") or "")
+        if not candidate_id:
+            return {"success": False, "error": "Candidate creation succeeded without a candidate_id."}
+
+        zero_scores = {
+            field: 0
+            for field in (
+                "reusability",
+                "verification",
+                "non_triviality",
+                "scope_quality",
+                "actionability",
+            )
+        }
+        review_result = update_candidate_review(
+            candidate_id,
+            scores=zero_scores,
+            total_score=0,
+            threshold_used=0,
+            decision=DECISION_PROMOTE_NEW,
+            decision_reason="Explicit user-requested save; admission review skipped and awaiting manual approval.",
+            summary_for_user=(
+                "Explicit skill save request staged for manual review. "
+                "Use /skillreviews view before approving if you want to inspect the full SKILL.md."
+            ),
+            target_skill="",
+            status=STATUS_REVIEWED,
+        )
+        if not review_result.get("success"):
+            delete_candidate(candidate_id)
+            return review_result
+
+        return {
+            "success": True,
+            "message": f"Skill candidate '{name}' created and queued for manual review.",
+            "candidate_id": candidate_id,
+            "decision": DECISION_PROMOTE_NEW,
+            "summary_for_user": "Explicit skill save request staged for manual review.",
+        }
+
+    def _create_automatic_skill_candidate_and_review(
+        self,
+        *,
+        name: str,
+        content: str,
+        category: Optional[str] = None,
+        scope: str,
+        why_created: str,
+        verification_summary: str,
+        reusability_rationale: Optional[str] = None,
+        known_limits: Optional[str] = None,
+        source_session_id: Optional[str] = None,
+        source_turn_range: Optional[List[int]] = None,
+        tool_calls: Optional[List[str]] = None,
+        commands_run: Optional[List[str]] = None,
+        tests_run: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
+        from tools.skill_candidate_tool import ORIGIN_AUTOMATIC_REVIEW, delete_candidate
+
+        create_result = self._stage_skill_candidate(
+            name=name,
+            content=content,
+            category=category,
+            scope=scope,
+            why_created=why_created,
+            verification_summary=verification_summary,
+            origin=ORIGIN_AUTOMATIC_REVIEW,
+            reusability_rationale=reusability_rationale,
+            known_limits=known_limits,
+            source_session_id=source_session_id,
+            source_turn_range=source_turn_range,
+            tool_calls=tool_calls,
+            commands_run=commands_run,
+            tests_run=tests_run,
+        )
+        if not create_result.get("success"):
+            return create_result
+
+        candidate_id = str(create_result.get("candidate_id") or "")
+        if not candidate_id:
+            return {"success": False, "error": "Candidate creation succeeded without a candidate_id."}
+
+        def _rollback_candidate() -> None:
+            # Deliberately roll back staged candidates when review never
+            # produces a verdict: the current UX has no surfaced failed-review
+            # state or retry path, so leaving a half-staged draft behind would
+            # be more confusing than failing the save outright.
+            rollback_result = delete_candidate(candidate_id)
+            if not rollback_result.get("success"):
+                logger.warning(
+                    "Failed to clean up staged skill candidate after review failure",
+                    extra={
+                        "candidate_id": candidate_id,
+                        "error": rollback_result.get("error", ""),
+                    },
+                )
+
+        try:
+            review_result = self._review_skill_candidate(candidate_id)
+        except Exception as exc:
+            _rollback_candidate()
+            return {
+                "success": False,
+                "error": f"Skill candidate review failed after staging: {exc}",
+            }
+        if not review_result.get("success"):
+            _rollback_candidate()
+            return review_result
+
+        if review_result.get("decision") == "promote_new":
+            return {
+                "success": True,
+                "message": f"Skill candidate '{name}' created and queued for manual review.",
+                "candidate_id": candidate_id,
+                "decision": "promote_new",
+                "summary_for_user": review_result.get("summary_for_user", ""),
+            }
+
+        return {
+            "success": False,
+            "message": f"Skill candidate '{name}' was reviewed and rejected.",
+            "candidate_id": candidate_id,
+            "decision": "reject",
+            "decision_reason": review_result.get("decision_reason", ""),
+        }
+
+    def _handle_strict_skill_create_request(
+        self,
+        function_args: Dict[str, Any],
+    ) -> str:
+        if getattr(self, "_is_background_review_agent", False):
+            return tool_error(
+                "Background skill reviews cannot create new skills directly in strict skill creation mode. "
+                "Automatic new-skill proposals must use the strict admission review path; existing skill updates "
+                "must use skill_manage(action='patch'|'edit'|'write_file').",
+                success=False,
+            )
+
+        name = str(function_args.get("name") or "").strip()
+        content = str(function_args.get("content") or "")
+        category = function_args.get("category")
+        if not name:
+            return tool_error("name is required for strict skill candidate creation.", success=False)
+        if not content:
+            return tool_error("content is required for strict skill candidate creation.", success=False)
+
+        result = self._create_user_requested_skill_candidate(
+            name=name,
+            content=content,
+            category=category,
+        )
+        return json.dumps(result, ensure_ascii=False)
+
+    def _handle_strict_skill_candidate_write_file_request(
+        self,
+        function_args: Dict[str, Any],
+    ) -> Optional[str]:
+        name = str(function_args.get("name") or "").strip()
+        if not name:
+            return None
+
+        try:
+            from tools.skill_manager_tool import _find_skill
+            if _find_skill(name):
+                return None
+
+            from tools.skill_candidate_tool import (
+                find_live_candidate_by_name,
+                write_candidate_file,
+            )
+
+            candidate = find_live_candidate_by_name(name)
+            if not candidate:
+                # Known concurrent-tool edge: skill_manage(create) and write_file
+                # for the same new skill can be emitted in one parallel batch.
+                # If write_file runs first, this falls through to the normal
+                # skill manager and is recoverable on the next turn; it does
+                # not write to the trusted store.
+                return None
+            result = write_candidate_file(
+                str(candidate.get("id") or ""),
+                str(function_args.get("file_path") or ""),
+                function_args.get("file_content"),
+            )
+            return json.dumps(result, ensure_ascii=False)
+        except Exception as exc:
+            return tool_error(f"Failed to stage candidate supporting file: {exc}", success=False)
+
+    def _spawn_strict_skill_background_review(self, messages_snapshot: List[Dict]) -> None:
+        import threading
+
+        def _run_review():
+            try:
+                from agent.skill_admission import maybe_generate_automatic_candidate
+
+                generated = maybe_generate_automatic_candidate(
+                    messages_snapshot,
+                    main_runtime=self._current_main_runtime(),
+                )
+                if not generated.get("success") or not generated.get("created"):
+                    return
+
+                result = self._create_automatic_skill_candidate_and_review(
+                    name=str(generated.get("name") or "").strip(),
+                    content=str(generated.get("content") or ""),
+                    category=str(generated.get("category") or "").strip() or None,
+                    scope=str(generated.get("scope") or "").strip(),
+                    why_created=str(generated.get("why_created") or "").strip(),
+                    verification_summary=str(generated.get("verification_summary") or "").strip(),
+                    reusability_rationale=str(generated.get("reusability_rationale") or "").strip() or None,
+                    known_limits=str(generated.get("known_limits") or "").strip() or None,
+                    source_session_id=self.session_id,
+                    source_turn_range=self._skill_candidate_turn_range(messages_snapshot),
+                    tool_calls=generated.get("tool_calls"),
+                    commands_run=generated.get("commands_run"),
+                    tests_run=generated.get("tests_run"),
+                )
+                if result.get("success") and result.get("decision") == "promote_new":
+                    _bg_cb = self.background_review_callback
+                    if _bg_cb:
+                        try:
+                            candidate_id = str(result.get("candidate_id") or "").strip()
+                            review_hint = (
+                                f"/skillreviews approve {candidate_id} or /skillreviews reject {candidate_id}"
+                                if candidate_id
+                                else "/skillreviews list"
+                            )
+                            _bg_cb(
+                                f"Skill proposal '{generated.get('name', '')}' is pending review. "
+                                f"Review with {review_hint}."
+                            )
+                        except Exception:
+                            pass
+            except Exception as exc:
+                logger.debug("Strict background skill review failed: %s", exc)
+
+        threading.Thread(target=_run_review, daemon=True, name="bg-skill-review").start()
+
+    def _spawn_background_skill_patch_review(self, messages_snapshot: List[Dict]) -> None:
+        self._spawn_background_review(
+            messages_snapshot=messages_snapshot,
+            prompt_override=self._SKILL_PATCH_REVIEW_PROMPT,
+            thread_name="bg-skill-patch-review",
+        )
+
     def _spawn_background_review(
         self,
         messages_snapshot: List[Dict],
         review_memory: bool = False,
         review_skills: bool = False,
+        prompt_override: Optional[str] = None,
+        thread_name: str = "bg-review",
     ) -> None:
         """Spawn a background thread to review the conversation for memory/skill saves.
 
@@ -3354,7 +3842,9 @@ class AIAgent:
         import threading
 
         # Pick the right prompt based on which triggers fired
-        if review_memory and review_skills:
+        if prompt_override is not None:
+            prompt = prompt_override
+        elif review_memory and review_skills:
             prompt = self._COMBINED_REVIEW_PROMPT
         elif review_memory:
             prompt = self._MEMORY_REVIEW_PROMPT
@@ -3405,6 +3895,10 @@ class AIAgent:
                         parent_session_id=self.session_id,
                         enabled_toolsets=["memory", "skills"],
                     )
+                    # Background review agents are allowed to update existing
+                    # skills, but strict-mode new-skill proposals must come
+                    # from the separate automatic admission path.
+                    review_agent._is_background_review_agent = True
                     review_agent._memory_write_origin = "background_review"
                     review_agent._memory_write_context = "background_review"
                     review_agent._memory_store = self._memory_store
@@ -3467,7 +3961,7 @@ class AIAgent:
                 except Exception:
                     pass
 
-        t = threading.Thread(target=_run_review, daemon=True, name="bg-review")
+        t = threading.Thread(target=_run_review, daemon=True, name=thread_name)
         t.start()
 
     def _build_memory_write_metadata(
@@ -4653,7 +5147,10 @@ class AIAgent:
         if "session_search" in self.valid_tool_names:
             tool_guidance.append(SESSION_SEARCH_GUIDANCE)
         if "skill_manage" in self.valid_tool_names:
-            tool_guidance.append(SKILLS_GUIDANCE)
+            if self._strict_skill_creation_active():
+                tool_guidance.append(STRICT_SKILLS_GUIDANCE)
+            else:
+                tool_guidance.append(SKILLS_GUIDANCE)
         if tool_guidance:
             prompt_parts.append(" ".join(tool_guidance))
 
@@ -4720,7 +5217,10 @@ class AIAgent:
             except Exception:
                 pass
 
-        has_skills_tools = any(name in self.valid_tool_names for name in ['skills_list', 'skill_view', 'skill_manage'])
+        has_skills_tools = any(
+            name in self.valid_tool_names
+            for name in ['skills_list', 'skill_view', 'skill_manage']
+        )
         if has_skills_tools:
             avail_toolsets = {
                 toolset
@@ -8929,6 +9429,18 @@ class AIAgent:
         if block_message is not None:
             return json.dumps({"error": block_message}, ensure_ascii=False)
 
+        block_message = self._strict_skill_store_write_block_message(function_name, function_args, effective_task_id)
+        if block_message is not None:
+            return tool_error(block_message, success=False)
+
+        if self._strict_skill_creation_active():
+            if function_name == "skill_manage" and str(function_args.get("action") or "").strip().lower() == "create":
+                return self._handle_strict_skill_create_request(function_args)
+            if function_name == "skill_manage" and str(function_args.get("action") or "").strip().lower() == "write_file":
+                staged_candidate_file = self._handle_strict_skill_candidate_write_file_request(function_args)
+                if staged_candidate_file is not None:
+                    return staged_candidate_file
+
         if function_name == "todo":
             from tools.todo_tool import todo_tool as _todo_tool
             return _todo_tool(
@@ -9055,8 +9567,10 @@ class AIAgent:
             if not isinstance(function_args, dict):
                 function_args = {}
 
+            strict_store_block = self._strict_skill_store_write_block_message(function_name, function_args, effective_task_id)
+
             # Checkpoint for file-mutating tools
-            if function_name in ("write_file", "patch") and self._checkpoint_mgr.enabled:
+            if strict_store_block is None and function_name in ("write_file", "patch") and self._checkpoint_mgr.enabled:
                 try:
                     file_path = function_args.get("path", "")
                     if file_path:
@@ -9387,8 +9901,11 @@ class AIAgent:
             except Exception:
                 pass
 
+            if _block_msg is None:
+                _block_msg = self._strict_skill_store_write_block_message(function_name, function_args, effective_task_id)
+
             if _block_msg is not None:
-                # Tool blocked by plugin policy — skip counter resets.
+                # Tool blocked by plugin or strict-mode policy — skip counter resets.
                 # Execution is handled below in the tool dispatch chain.
                 pass
             else:
@@ -9458,12 +9975,27 @@ class AIAgent:
                 except Exception:
                     pass  # never block tool execution
 
+            strict_candidate_file_result: Optional[str] = None
+            if (
+                _block_msg is None
+                and self._strict_skill_creation_active()
+                and function_name == "skill_manage"
+                and str(function_args.get("action") or "").strip().lower() == "write_file"
+            ):
+                strict_candidate_file_result = self._handle_strict_skill_candidate_write_file_request(function_args)
+
             tool_start_time = time.time()
 
             if _block_msg is not None:
                 # Tool blocked by plugin policy — return error without executing.
                 function_result = json.dumps({"error": _block_msg}, ensure_ascii=False)
                 tool_duration = 0.0
+            elif self._strict_skill_creation_active() and function_name == "skill_manage" and str(function_args.get("action") or "").strip().lower() == "create":
+                function_result = self._handle_strict_skill_create_request(function_args)
+                tool_duration = time.time() - tool_start_time
+            elif strict_candidate_file_result is not None:
+                function_result = strict_candidate_file_result
+                tool_duration = time.time() - tool_start_time
             elif function_name == "todo":
                 from tools.todo_tool import todo_tool as _todo_tool
                 function_result = _todo_tool(
@@ -13333,13 +13865,28 @@ class AIAgent:
 
         # Background memory/skill review — runs AFTER the response is delivered
         # so it never competes with the user's task for model attention.
-        if final_response and not interrupted and (_should_review_memory or _should_review_skills):
+        if final_response and not interrupted:
             try:
-                self._spawn_background_review(
-                    messages_snapshot=list(messages),
-                    review_memory=_should_review_memory,
-                    review_skills=_should_review_skills,
-                )
+                if self._strict_skill_creation_active():
+                    if _should_review_memory:
+                        self._spawn_background_review(
+                            messages_snapshot=list(messages),
+                            review_memory=True,
+                            review_skills=False,
+                        )
+                    if _should_review_skills:
+                        self._spawn_background_skill_patch_review(
+                            messages_snapshot=list(messages),
+                        )
+                        self._spawn_strict_skill_background_review(
+                            messages_snapshot=list(messages),
+                        )
+                elif _should_review_memory or _should_review_skills:
+                    self._spawn_background_review(
+                        messages_snapshot=list(messages),
+                        review_memory=_should_review_memory,
+                        review_skills=_should_review_skills,
+                    )
             except Exception:
                 pass  # Background review is best-effort
 

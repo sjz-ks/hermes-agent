@@ -483,6 +483,16 @@ skills:
   # Set to 0 to disable.
   creation_nudge_interval: 15
 
+  # Strict skill creation mode for terminal frontends (CLI + TUI).
+  # New skill saves are staged as review candidates instead of being trusted
+  # immediately. Review them manually with /skillreviews list|view|approve|reject.
+  strict_creation_mode: false
+
+  # Minimum admission score for automatic skill proposals before they enter the
+  # manual review queue. Explicit user-requested saves skip this LLM admission
+  # score and still require manual /skillreviews approval.
+  automatic_min_score: 7
+
   # External skill directories — share skills across tools/agents without
   # copying them into ~/.hermes/skills/.  Each path is expanded (~ and ${VAR})
   # and resolved to an absolute path.  External dirs are read-only: skill

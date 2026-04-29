@@ -888,6 +888,8 @@ DEFAULT_CONFIG = {
     # always goes to ~/.hermes/skills/.
     "skills": {
         "external_dirs": [],   # e.g. ["~/.agents/skills", "/shared/team-skills"]
+        "strict_creation_mode": False,  # Route new skill creation through candidate review (terminal frontends: CLI + TUI)
+        "automatic_min_score": 7,  # Minimum automatic-candidate admission score on the 10-point, 5-dimension rubric
         # Substitute ${HERMES_SKILL_DIR} and ${HERMES_SESSION_ID} in SKILL.md
         # content with the absolute skill directory and the active session id
         # before the agent sees it.  Lets skill authors reference bundled
@@ -2552,7 +2554,7 @@ _KNOWN_ROOT_KEYS = {
     "fallback_providers", "credential_pool_strategies", "toolsets",
     "agent", "terminal", "display", "compression", "delegation",
     "auxiliary", "custom_providers", "context", "memory", "gateway",
-    "sessions",
+    "sessions", "skills",
 }
 
 # Valid fields inside a custom_providers list entry

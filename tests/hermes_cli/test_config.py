@@ -640,3 +640,23 @@ class TestUserMessagePreviewConfig:
         preview = DEFAULT_CONFIG["display"]["user_message_preview"]
         assert preview["first_lines"] == 2
         assert preview["last_lines"] == 2
+
+
+class TestStrictSkillCreationModeConfig:
+    def test_default_config_disables_strict_skill_creation_mode(self):
+        assert DEFAULT_CONFIG["skills"]["strict_creation_mode"] is False
+        assert DEFAULT_CONFIG["skills"]["automatic_min_score"] == 7
+
+    def test_load_config_supplies_strict_skill_creation_defaults(self, tmp_path):
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text(
+            yaml.safe_dump({"skills": {"external_dirs": ["~/shared-skills"]}}),
+            encoding="utf-8",
+        )
+
+        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+            config = load_config()
+
+        assert config["skills"]["external_dirs"] == ["~/shared-skills"]
+        assert config["skills"]["strict_creation_mode"] is False
+        assert config["skills"]["automatic_min_score"] == 7

@@ -2194,6 +2194,9 @@ class HermesCLI:
         self._image_counter = 0
         self.preloaded_skills: list[str] = []
         self._startup_skills_line_shown = False
+        self._pending_skill_review_ids: list[str] = []
+        self._seen_skill_review_ids: set[str] = set()
+        self._last_skill_review_poll: float = 0.0
 
         # Voice mode state (also reinitialized inside run() for interactive TUI).
         self._voice_lock = threading.Lock()
@@ -5985,6 +5988,189 @@ class HermesCLI:
         from hermes_cli.skills_hub import handle_skills_slash
         handle_skills_slash(cmd, ChatConsole())
 
+    def _strict_skill_creation_mode_enabled(self) -> bool:
+        try:
+            skills_cfg = self.config.get("skills", {}) if isinstance(self.config, dict) else {}
+            return bool((skills_cfg or {}).get("strict_creation_mode", False))
+        except Exception:
+            return False
+
+    def _poll_pending_skill_review_candidates(self) -> None:
+        if not self._strict_skill_creation_mode_enabled():
+            return
+        now = time.monotonic()
+        if now - self._last_skill_review_poll < 1.0:
+            return
+        self._last_skill_review_poll = now
+
+        try:
+            from tools.skill_candidate_tool import list_candidates
+
+            result = list_candidates(pending_only=True)
+            if not result.get("success"):
+                return
+            for candidate in result.get("candidates", []):
+                candidate_id = str(candidate.get("id") or "")
+                if not candidate_id:
+                    continue
+                if candidate_id in self._seen_skill_review_ids or candidate_id in self._pending_skill_review_ids:
+                    continue
+                self._pending_skill_review_ids.append(candidate_id)
+        except Exception:
+            pass
+
+    def _surface_next_pending_skill_review(self) -> None:
+        if not self._pending_skill_review_ids:
+            return
+        candidate_id = self._pending_skill_review_ids.pop(0)
+        try:
+            from tools.skill_candidate_tool import view_candidate
+
+            result = view_candidate(candidate_id)
+            if not result.get("success"):
+                return
+            candidate = result.get("candidate") or {}
+            review = candidate.get("review") or {}
+            if candidate.get("status") != "reviewed" or review.get("decision") != "promote_new":
+                return
+            self._seen_skill_review_ids.add(candidate_id)
+            name = candidate.get("proposed_name", candidate_id)
+            scope = candidate.get("scope", "")
+            verification = candidate.get("verification_summary", "")
+            summary = review.get("summary_for_user", "") or candidate.get("why_created", "")
+            _cprint("")
+            _cprint(f"  🧪 Pending skill proposal: {name}")
+            if summary:
+                _cprint(f"     Why: {summary}")
+            if scope:
+                _cprint(f"     Scope: {scope}")
+            if verification:
+                _cprint(f"     Verification: {verification}")
+            _cprint(f"     View content with: /skillreviews view {candidate_id}")
+            _cprint(
+                f"     Review with: /skillreviews approve {candidate_id}  or  /skillreviews reject {candidate_id}"
+            )
+            _cprint("")
+        except Exception:
+            pass
+
+    def _handle_skillreviews_command(self, cmd: str):
+        """Handle /skillreviews [list|view|approve|reject] [candidate-id]."""
+        parts = cmd.strip().split(maxsplit=2)
+        subcommand = parts[1].lower() if len(parts) > 1 else "list"
+        candidate_id = parts[2].strip() if len(parts) > 2 else ""
+
+        from tools.skill_candidate_tool import (
+            CANDIDATES_DIR,
+            list_candidates,
+            promote_candidate,
+            reject_candidate,
+            view_candidate,
+        )
+
+        if subcommand in {"list", "pending"}:
+            result = list_candidates(pending_only=True)
+            if not result.get("success"):
+                _cprint(f"  Could not load skill proposals: {result.get('error', 'unknown error')}")
+                return
+            candidates = result.get("candidates", [])
+            if not candidates:
+                _cprint("  No pending skill proposals.")
+                return
+            _cprint(f"  Pending skill proposals ({len(candidates)}):")
+            for item in candidates:
+                cid = item.get("id", "")
+                name = item.get("proposed_name", cid)
+                scope = item.get("scope", "")
+                summary = item.get("summary_for_user", "")
+                _cprint(f"    • {cid} — {name}")
+                if summary:
+                    _cprint(f"      {summary}")
+                if scope:
+                    _cprint(f"      scope: {scope}")
+            _cprint("  View content with: /skillreviews view <candidate-id>")
+            return
+
+        if not candidate_id:
+            _cprint("  Usage: /skillreviews [list|view|approve|reject] [candidate-id]")
+            return
+
+        if subcommand in {"view", "show"}:
+            view = view_candidate(candidate_id)
+            if not view.get("success"):
+                _cprint(f"  {view.get('error', 'Candidate not found.')}")
+                return
+            candidate = view.get("candidate") or {}
+            review = candidate.get("review") or {}
+            cid = str(candidate.get("id") or candidate_id)
+            # Keep approval one-step, but make the exact staged SKILL.md easy to inspect first.
+            _cprint(f"  Skill proposal: {candidate.get('proposed_name', cid)}")
+            _cprint(f"  Candidate ID: {cid}")
+            _cprint(f"  Status: {candidate.get('status', '')}")
+            if candidate.get("origin"):
+                _cprint(f"  Origin: {candidate.get('origin')}")
+            if candidate.get("scope"):
+                _cprint(f"  Scope: {candidate.get('scope')}")
+            if candidate.get("verification_summary"):
+                _cprint(f"  Verification: {candidate.get('verification_summary')}")
+            if review.get("summary_for_user"):
+                _cprint(f"  Review summary: {review.get('summary_for_user')}")
+            _cprint(f"  Staged path: {CANDIDATES_DIR / cid}")
+            supporting_files = candidate.get("supporting_files") or []
+            if supporting_files:
+                # Keep review lightweight: show staged supporting file names, not full file bodies.
+                _cprint("  Staged supporting files:")
+                for file_path in supporting_files:
+                    _cprint(f"    - {file_path}")
+            _cprint("")
+            _cprint("  --- SKILL.md ---")
+            skill_content = str(candidate.get("skill_content") or "").rstrip()
+            if skill_content:
+                skill_lines = skill_content.splitlines()
+                max_skill_preview_lines = 100
+                _cprint("\n".join(skill_lines[:max_skill_preview_lines]))
+                if len(skill_lines) > max_skill_preview_lines:
+                    _cprint(
+                        f"  ... truncated after {max_skill_preview_lines} lines. "
+                        f"Full SKILL.md: {CANDIDATES_DIR / cid / 'SKILL.md'}"
+                    )
+            else:
+                _cprint("  (empty)")
+            _cprint("  --- end SKILL.md ---")
+            return
+
+        if subcommand == "approve":
+            global _skill_commands
+            view = view_candidate(candidate_id)
+            if not view.get("success"):
+                _cprint(f"  {view.get('error', 'Candidate not found.')}")
+                return
+            try:
+                result = promote_candidate(candidate_id)
+            except Exception as exc:
+                _cprint(f"  Could not promote candidate: {exc}")
+                return
+            if result.get("success"):
+                _skill_commands = scan_skill_commands()
+                self._seen_skill_review_ids.discard(candidate_id)
+                self._pending_skill_review_ids = [cid for cid in self._pending_skill_review_ids if cid != candidate_id]
+                _cprint(f"  ✓ {result.get('message', 'Candidate promoted.')}")
+            else:
+                _cprint(f"  Could not promote candidate: {result.get('error', 'unknown error')}")
+            return
+
+        if subcommand == "reject":
+            result = reject_candidate(candidate_id)
+            if result.get("success"):
+                self._seen_skill_review_ids.discard(candidate_id)
+                self._pending_skill_review_ids = [cid for cid in self._pending_skill_review_ids if cid != candidate_id]
+                _cprint(f"  ✓ {result.get('message', 'Candidate rejected.')}")
+            else:
+                _cprint(f"  Could not reject candidate: {result.get('error', 'unknown error')}")
+            return
+
+        _cprint("  Usage: /skillreviews [list|view|approve|reject] [candidate-id]")
+
     def _show_gateway_status(self):
         """Show status of the gateway and connected messaging platforms."""
         from gateway.config import load_gateway_config, Platform
@@ -6226,6 +6412,8 @@ class HermesCLI:
         elif canonical == "skills":
             with self._busy_command(self._slow_command_status(cmd_original)):
                 self._handle_skills_command(cmd_original)
+        elif canonical == "skillreviews":
+            self._handle_skillreviews_command(cmd_original)
         elif canonical == "platforms":
             self._show_gateway_status()
         elif canonical == "status":
@@ -9398,6 +9586,9 @@ class HermesCLI:
         # Clipboard image attachments (paste images into the CLI)
         self._attached_images: list[Path] = []
         self._image_counter = 0
+        self._pending_skill_review_ids = []
+        self._seen_skill_review_ids = set()
+        self._last_skill_review_poll = 0.0
 
         # Voice mode state (protected by _voice_lock for cross-thread access)
         self._voice_lock = threading.Lock()
@@ -10892,6 +11083,8 @@ class HermesCLI:
                         # Periodic config watcher — auto-reload MCP on mcp_servers change
                         if not self._agent_running:
                             self._check_config_mcp_changes()
+                            self._poll_pending_skill_review_candidates()
+                            self._surface_next_pending_skill_review()
                             # Check for background process notifications (completions
                             # and watch pattern matches) while agent is idle.
                             try:

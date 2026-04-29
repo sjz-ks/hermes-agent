@@ -256,6 +256,101 @@ def test_startup_runtime_does_not_call_network_detector(monkeypatch):
     assert provider in {None, "anthropic"}
 
 
+def test_background_review_callback_emits_status_update():
+    with patch("tui_gateway.server._emit") as emit:
+        cb = server._agent_cbs("sid")["background_review_callback"]
+        cb("Skill proposal 'demo' is pending review. Review with /skillreviews list.")
+
+    emit.assert_called_once_with(
+        "status.update",
+        "sid",
+        {"kind": "info", "text": "Skill proposal 'demo' is pending review. Review with /skillreviews list."},
+    )
+
+
+def test_make_agent_sets_background_review_callback_after_construction(monkeypatch):
+    captured = {}
+
+    class _FakeAgent:
+        def __init__(self, **kwargs):
+            captured["kwargs"] = kwargs
+            self.background_review_callback = None
+
+    monkeypatch.setattr("run_agent.AIAgent", _FakeAgent)
+    monkeypatch.setattr(server, "_load_cfg", lambda: {"agent": {}, "display": {}})
+    monkeypatch.setattr(server, "_resolve_startup_runtime", lambda: ("test-model", "openrouter"))
+    monkeypatch.setattr(
+        "hermes_cli.runtime_provider.resolve_runtime_provider",
+        lambda requested, target_model=None: {
+            "provider": requested,
+            "base_url": "https://example.test/v1",
+            "api_key": "test-key",
+            "api_mode": None,
+        },
+    )
+    monkeypatch.setattr(server, "_load_tool_progress_mode", lambda: "all")
+    monkeypatch.setattr(server, "_load_reasoning_config", lambda: None)
+    monkeypatch.setattr(server, "_load_service_tier", lambda: None)
+    monkeypatch.setattr(server, "_load_enabled_toolsets", lambda: [])
+    monkeypatch.setattr(server, "_get_db", lambda: None)
+
+    agent = server._make_agent("sid", "session-key", session_id="session-id")
+
+    assert "background_review_callback" not in captured["kwargs"]
+    assert callable(agent.background_review_callback)
+
+
+def test_prompt_background_wires_review_callback_to_parent_status(monkeypatch):
+    events = []
+
+    class _FakeAgent:
+        def __init__(self, **kwargs):
+            self.background_review_callback = None
+
+        def run_conversation(self, **kwargs):
+            assert callable(self.background_review_callback)
+            self.background_review_callback("Skill proposal 'demo' is pending review.")
+            return {"final_response": "background done"}
+
+    class _ImmediateThread:
+        def __init__(self, target, daemon=False):
+            self._target = target
+
+        def start(self):
+            self._target()
+
+    server._sessions["sid"] = _session(agent=types.SimpleNamespace())
+    monkeypatch.setattr("run_agent.AIAgent", _FakeAgent)
+    monkeypatch.setattr(server, "_background_agent_kwargs", lambda agent, task_id: {})
+    monkeypatch.setattr(server, "_set_session_context", lambda task_id: ())
+    monkeypatch.setattr(server, "_clear_session_context", lambda tokens: None)
+    monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
+    monkeypatch.setattr(
+        server,
+        "_emit",
+        lambda event, sid, payload=None: events.append((event, sid, payload)),
+    )
+
+    try:
+        resp = server.handle_request(
+            {
+                "id": "1",
+                "method": "prompt.background",
+                "params": {"session_id": "sid", "text": "summarize this later"},
+            }
+        )
+    finally:
+        server._sessions.pop("sid", None)
+
+    assert resp["result"]["task_id"].startswith("bg_")
+    assert (
+        "status.update",
+        "sid",
+        {"kind": "info", "text": "Skill proposal 'demo' is pending review."},
+    ) in events
+    assert any(event == "background.complete" for event, _sid, _payload in events)
+
+
 def _session(agent=None, **extra):
     return {
         "agent": agent if agent is not None else types.SimpleNamespace(),
@@ -2238,6 +2333,60 @@ def test_mirror_slash_side_effects_allowed_when_idle(monkeypatch):
     # Should NOT contain "session busy" — the switch went through.
     assert "session busy" not in warning
     assert applied["model"]
+
+
+def test_mirror_slash_side_effects_refreshes_skills_after_skillreview_approve(monkeypatch):
+    calls = {"scan": 0, "clear_snapshot": None}
+
+    def fake_scan_skill_commands():
+        calls["scan"] += 1
+        return {}
+
+    def fake_clear_skills_system_prompt_cache(*, clear_snapshot=False):
+        calls["clear_snapshot"] = clear_snapshot
+
+    monkeypatch.setattr("agent.skill_commands.scan_skill_commands", fake_scan_skill_commands)
+    monkeypatch.setattr(
+        "agent.prompt_builder.clear_skills_system_prompt_cache",
+        fake_clear_skills_system_prompt_cache,
+    )
+
+    warning = server._mirror_slash_side_effects(
+        "sid",
+        _session(running=False),
+        "/skillreviews approve cand-123",
+    )
+
+    assert warning == ""
+    assert calls == {"scan": 1, "clear_snapshot": True}
+
+
+def test_mirror_slash_side_effects_does_not_refresh_skills_for_non_approve_skillreviews(monkeypatch):
+    calls = {"scan": 0, "clear": 0}
+
+    def fake_scan_skill_commands():
+        calls["scan"] += 1
+        return {}
+
+    def fake_clear_skills_system_prompt_cache(*, clear_snapshot=False):
+        calls["clear"] += 1
+
+    monkeypatch.setattr("agent.skill_commands.scan_skill_commands", fake_scan_skill_commands)
+    monkeypatch.setattr(
+        "agent.prompt_builder.clear_skills_system_prompt_cache",
+        fake_clear_skills_system_prompt_cache,
+    )
+
+    for command in [
+        "/skillreviews list",
+        "/skillreviews view cand-123",
+        "/skillreviews reject cand-123",
+        "/skillreviews",
+    ]:
+        warning = server._mirror_slash_side_effects("sid", _session(running=False), command)
+        assert warning == ""
+
+    assert calls == {"scan": 0, "clear": 0}
 
 
 # ---------------------------------------------------------------------------

@@ -1263,6 +1263,7 @@ def _agent_cbs(sid: str) -> dict:
         status_callback=lambda kind, text=None: _status_update(
             sid, str(kind), None if text is None else str(text)
         ),
+        background_review_callback=lambda text: _status_update(sid, "info", str(text)),
         clarify_callback=lambda q, c: _block(
             "clarify.request", sid, {"question": q, "choices": c}
         ),
@@ -1438,7 +1439,9 @@ def _make_agent(sid: str, key: str, session_id: str | None = None):
         requested=requested_provider,
         target_model=model or None,
     )
-    return AIAgent(
+    callbacks = _agent_cbs(sid)
+    background_review_callback = callbacks.pop("background_review_callback", None)
+    agent = AIAgent(
         model=model,
         provider=runtime.get("provider"),
         base_url=runtime.get("base_url"),
@@ -1456,8 +1459,10 @@ def _make_agent(sid: str, key: str, session_id: str | None = None):
         session_id=session_id or key,
         session_db=_get_db(),
         ephemeral_system_prompt=system_prompt or None,
-        **_agent_cbs(sid),
+        **callbacks,
     )
+    agent.background_review_callback = background_review_callback
+    return agent
 
 
 def _init_session(sid: str, key: str, agent, history: list, cols: int = 80):
@@ -2829,9 +2834,13 @@ def _(rid, params: dict) -> dict:
         try:
             from run_agent import AIAgent
 
-            result = AIAgent(
-                **_background_agent_kwargs(session["agent"], task_id)
-            ).run_conversation(
+            agent = AIAgent(**_background_agent_kwargs(session["agent"], task_id))
+            # TUI background agents skip the foreground constructor path, so wire
+            # the same strict-skill review prompt back to the parent session here.
+            agent.background_review_callback = lambda text: _status_update(
+                parent, "info", str(text)
+            )
+            result = agent.run_conversation(
                 user_message=text,
                 task_id=task_id,
             )
@@ -4308,6 +4317,7 @@ def _mirror_slash_side_effects(sid: str, session: dict, command: str) -> str:
         (parts[1].strip() if len(parts) > 1 else ""),
         session.get("agent"),
     )
+    subcommand = arg.split(maxsplit=1)[0].lower() if arg else ""
 
     # Reject agent-mutating commands during an in-flight turn.  These
     # all do read-then-mutate on live agent/session state that the
@@ -4343,6 +4353,12 @@ def _mirror_slash_side_effects(sid: str, session: dict, command: str) -> str:
             _emit("session.info", sid, _session_info(agent))
         elif name == "reload-mcp" and agent and hasattr(agent, "reload_mcp_tools"):
             agent.reload_mcp_tools()
+        elif name == "skillreviews" and subcommand == "approve":
+            from agent.prompt_builder import clear_skills_system_prompt_cache
+            from agent.skill_commands import scan_skill_commands
+
+            scan_skill_commands()
+            clear_skills_system_prompt_cache(clear_snapshot=True)
         elif name == "stop":
             from tools.process_registry import process_registry
 

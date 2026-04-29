@@ -182,6 +182,15 @@ SKILLS_GUIDANCE = (
     "Skills that aren't maintained become liabilities."
 )
 
+STRICT_SKILLS_GUIDANCE = (
+    "When you discover a reusable new workflow, do not create a trusted skill directly. "
+    "If the user explicitly asks to save it, use skill_manage(action='create') with "
+    "the skill name, full SKILL.md content, and category when useful; in strict creation mode "
+    "it will be staged for review instead of being trusted immediately.\n"
+    "After difficult/iterative tasks, offer to save the workflow as a skill instead "
+    "of silently creating one."
+)
+
 TOOL_USE_ENFORCEMENT_GUIDANCE = (
     "# Tool-use enforcement\n"
     "You MUST use your tools to take action — do not describe what you would do "

@@ -52,6 +52,29 @@ def test_is_destructive_command_treats_install_as_mutating():
     assert run_agent._is_destructive_command("install template.env .env") is True
 
 
+def _make_strict_skill_agent(platform: str = "cli") -> AIAgent:
+    with (
+        patch(
+            "run_agent.get_tool_definitions",
+            return_value=_make_tool_defs("write_file", "patch", "skill_manage"),
+        ),
+        patch("run_agent.check_toolset_requirements", return_value={}),
+        patch("run_agent.OpenAI"),
+        patch(
+            "hermes_cli.config.load_config",
+            return_value={"skills": {"strict_creation_mode": True}},
+        ),
+    ):
+        return AIAgent(
+            api_key="test-k...7890",
+            base_url="https://openrouter.ai/api/v1",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+            platform=platform,
+        )
+
+
 @pytest.fixture()
 def agent():
     """Minimal AIAgent with mocked OpenAI client and tool loading."""
@@ -913,6 +936,7 @@ class TestBuildSystemPrompt:
                 quiet_mode=True,
                 skip_context_files=True,
                 skip_memory=True,
+                platform="cli",
             )
 
             prompt = agent._build_system_prompt()
@@ -921,6 +945,874 @@ class TestBuildSystemPrompt:
         assert mock_skills.call_args.kwargs["available_tools"] == set(toolset_map)
         assert mock_skills.call_args.kwargs["available_toolsets"] == {"web", "skills"}
 
+    def test_strict_mode_uses_candidate_guidance_for_new_skills(self):
+        tools = _make_tool_defs("skills_list", "skill_view", "skill_manage")
+        with (
+            patch("run_agent.get_tool_definitions", return_value=tools),
+            patch("run_agent.check_toolset_requirements", return_value={}),
+            patch("run_agent.OpenAI"),
+            patch(
+                "hermes_cli.config.load_config",
+                return_value={"skills": {"strict_creation_mode": True}},
+            ),
+        ):
+            agent = AIAgent(
+                api_key="test-k...7890",
+                base_url="https://openrouter.ai/api/v1",
+                quiet_mode=True,
+                skip_context_files=True,
+                skip_memory=True,
+                platform="cli",
+            )
+
+        prompt = agent._build_system_prompt()
+        from agent.prompt_builder import STRICT_SKILLS_GUIDANCE, SKILLS_GUIDANCE
+
+        assert STRICT_SKILLS_GUIDANCE in prompt
+        assert SKILLS_GUIDANCE not in prompt
+        assert "skill_manage(action='create')" in STRICT_SKILLS_GUIDANCE
+        assert "full SKILL.md content" in STRICT_SKILLS_GUIDANCE
+        assert "skill_manage(action='patch')" not in STRICT_SKILLS_GUIDANCE
+        assert "scope, why_created, and verification_summary" not in STRICT_SKILLS_GUIDANCE
+
+    def test_tui_strict_mode_uses_candidate_guidance_for_new_skills(self):
+        tools = _make_tool_defs("skills_list", "skill_view", "skill_manage")
+        with (
+            patch("run_agent.get_tool_definitions", return_value=tools),
+            patch("run_agent.check_toolset_requirements", return_value={}),
+            patch("run_agent.OpenAI"),
+            patch(
+                "hermes_cli.config.load_config",
+                return_value={"skills": {"strict_creation_mode": True}},
+            ),
+        ):
+            agent = AIAgent(
+                api_key="test-k...7890",
+                base_url="https://openrouter.ai/api/v1",
+                quiet_mode=True,
+                skip_context_files=True,
+                skip_memory=True,
+                platform="tui",
+            )
+
+        prompt = agent._build_system_prompt()
+        from agent.prompt_builder import STRICT_SKILLS_GUIDANCE, SKILLS_GUIDANCE
+
+        assert STRICT_SKILLS_GUIDANCE in prompt
+        assert SKILLS_GUIDANCE not in prompt
+
+    def test_non_terminal_strict_mode_uses_standard_skills_guidance(self):
+        tools = _make_tool_defs("skills_list", "skill_view", "skill_manage")
+        with (
+            patch("run_agent.get_tool_definitions", return_value=tools),
+            patch("run_agent.check_toolset_requirements", return_value={}),
+            patch("run_agent.OpenAI"),
+            patch(
+                "hermes_cli.config.load_config",
+                return_value={"skills": {"strict_creation_mode": True}},
+            ),
+        ):
+            agent = AIAgent(
+                api_key="test-k...7890",
+                base_url="https://openrouter.ai/api/v1",
+                quiet_mode=True,
+                skip_context_files=True,
+                skip_memory=True,
+                platform="telegram",
+            )
+
+        prompt = agent._build_system_prompt()
+        from agent.prompt_builder import STRICT_SKILLS_GUIDANCE, SKILLS_GUIDANCE
+
+        assert STRICT_SKILLS_GUIDANCE not in prompt
+        assert SKILLS_GUIDANCE in prompt
+        assert "skill_manage(action='patch')" in SKILLS_GUIDANCE
+
+    def test_invoke_tool_routes_trusted_skill_create_in_strict_mode(self):
+        with (
+            patch("run_agent.get_tool_definitions", return_value=_make_tool_defs("skill_manage")),
+            patch("run_agent.check_toolset_requirements", return_value={}),
+            patch("run_agent.OpenAI"),
+            patch(
+                "hermes_cli.config.load_config",
+                return_value={"skills": {"strict_creation_mode": True}},
+            ),
+        ):
+            agent = AIAgent(
+                api_key="test-k...7890",
+                base_url="https://openrouter.ai/api/v1",
+                quiet_mode=True,
+                skip_context_files=True,
+                skip_memory=True,
+                platform="cli",
+            )
+
+        with patch.object(agent, "_handle_strict_skill_create_request", return_value='{"success": true}') as routed, \
+             patch("run_agent.handle_function_call", side_effect=AssertionError("trusted create should be routed before registry dispatch")):
+            result = agent._invoke_tool(
+                "skill_manage",
+                {"action": "create", "name": "demo", "content": "---\nname: demo\ndescription: desc\n---\n\n# Demo\n"},
+                effective_task_id="session-1",
+                messages=[],
+            )
+
+        assert result == '{"success": true}'
+        routed.assert_called_once()
+
+    def test_invoke_tool_routes_tui_skill_create_in_strict_mode(self):
+        with (
+            patch("run_agent.get_tool_definitions", return_value=_make_tool_defs("skill_manage")),
+            patch("run_agent.check_toolset_requirements", return_value={}),
+            patch("run_agent.OpenAI"),
+            patch(
+                "hermes_cli.config.load_config",
+                return_value={"skills": {"strict_creation_mode": True}},
+            ),
+        ):
+            agent = AIAgent(
+                api_key="test-k...7890",
+                base_url="https://openrouter.ai/api/v1",
+                quiet_mode=True,
+                skip_context_files=True,
+                skip_memory=True,
+                platform="tui",
+            )
+
+        with patch.object(agent, "_handle_strict_skill_create_request", return_value='{"success": true}') as routed, \
+             patch("run_agent.handle_function_call", side_effect=AssertionError("strict create should be routed before registry dispatch")):
+            result = agent._invoke_tool(
+                "skill_manage",
+                {"action": "create", "name": "demo", "content": "---\nname: demo\ndescription: desc\n---\n\n# Demo\n"},
+                effective_task_id="session-1",
+                messages=[],
+            )
+
+        assert result == '{"success": true}'
+        routed.assert_called_once()
+
+    def test_invoke_tool_non_terminal_strict_mode_keeps_legacy_skill_create_path(self):
+        with (
+            patch("run_agent.get_tool_definitions", return_value=_make_tool_defs("skill_manage")),
+            patch("run_agent.check_toolset_requirements", return_value={}),
+            patch("run_agent.OpenAI"),
+            patch(
+                "hermes_cli.config.load_config",
+                return_value={"skills": {"strict_creation_mode": True}},
+            ),
+        ):
+            agent = AIAgent(
+                api_key="test-k...7890",
+                base_url="https://openrouter.ai/api/v1",
+                quiet_mode=True,
+                skip_context_files=True,
+                skip_memory=True,
+                platform="telegram",
+            )
+
+        with patch.object(agent, "_handle_strict_skill_create_request", side_effect=AssertionError("non-CLI should not use strict create path")), \
+             patch("run_agent.handle_function_call", return_value='{"success": true, "message": "created"}') as dispatch:
+            result = agent._invoke_tool(
+                "skill_manage",
+                {"action": "create", "name": "demo", "content": "---\nname: demo\ndescription: desc\n---\n\n# Demo\n"},
+                effective_task_id="session-1",
+                messages=[],
+            )
+
+        assert result == '{"success": true, "message": "created"}'
+        dispatch.assert_called_once()
+
+    @pytest.mark.parametrize(
+        "relative_path",
+        [
+            "demo/SKILL.md",
+            "demo/references/notes.md",
+        ],
+    )
+    def test_strict_mode_blocks_write_file_inside_trusted_skills_store(self, tmp_path, monkeypatch, relative_path):
+        agent = _make_strict_skill_agent(platform="cli")
+        skills_dir = tmp_path / "skills"
+        target = skills_dir / relative_path
+        monkeypatch.setattr("tools.skill_manager_tool.SKILLS_DIR", skills_dir)
+        monkeypatch.setattr("agent.skill_utils.get_all_skills_dirs", lambda: [skills_dir])
+
+        with patch(
+            "run_agent.handle_function_call",
+            side_effect=AssertionError("strict skills store writes should be blocked before dispatch"),
+        ) as dispatch:
+            result = agent._invoke_tool(
+                "write_file",
+                {"path": str(target), "content": "blocked"},
+                effective_task_id="session-1",
+                messages=[],
+            )
+
+        payload = json.loads(result)
+        assert payload["success"] is False
+        assert "Direct writes to trusted skill directories are blocked" in payload["error"]
+        dispatch.assert_not_called()
+
+    def test_strict_mode_blocks_write_file_using_live_file_tool_cwd(self, tmp_path, monkeypatch):
+        agent = _make_strict_skill_agent(platform="cli")
+        live_cwd = tmp_path / "hermes-home"
+        stale_cwd = tmp_path / "workspace"
+        skills_dir = live_cwd / "skills"
+        monkeypatch.setattr("tools.skill_manager_tool.SKILLS_DIR", skills_dir)
+        monkeypatch.setattr("agent.skill_utils.get_all_skills_dirs", lambda: [skills_dir])
+        monkeypatch.setattr(
+            "tools.file_tools._get_live_tracking_cwd",
+            lambda task_id: str(live_cwd),
+        )
+        monkeypatch.setenv("TERMINAL_CWD", str(stale_cwd))
+
+        with patch(
+            "run_agent.handle_function_call",
+            side_effect=AssertionError("strict skills store writes should be blocked before dispatch"),
+        ) as dispatch:
+            result = agent._invoke_tool(
+                "write_file",
+                {"path": "skills/demo/SKILL.md", "content": "blocked"},
+                effective_task_id="session-1",
+                messages=[],
+            )
+
+        payload = json.loads(result)
+        assert payload["success"] is False
+        assert "Direct writes to trusted skill directories are blocked" in payload["error"]
+        dispatch.assert_not_called()
+
+    def test_strict_mode_blocks_patch_replace_inside_trusted_skills_store(self, tmp_path, monkeypatch):
+        agent = _make_strict_skill_agent(platform="cli")
+        skills_dir = tmp_path / "skills"
+        monkeypatch.setattr("tools.skill_manager_tool.SKILLS_DIR", skills_dir)
+        monkeypatch.setattr("agent.skill_utils.get_all_skills_dirs", lambda: [skills_dir])
+
+        with patch(
+            "run_agent.handle_function_call",
+            side_effect=AssertionError("strict skills store patches should be blocked before dispatch"),
+        ) as dispatch:
+            result = agent._invoke_tool(
+                "patch",
+                {
+                    "mode": "replace",
+                    "path": str(skills_dir / "demo" / "SKILL.md"),
+                    "old_string": "old",
+                    "new_string": "new",
+                },
+                effective_task_id="session-1",
+                messages=[],
+            )
+
+        payload = json.loads(result)
+        assert payload["success"] is False
+        assert "existing skill edits must use skill_manage" in payload["error"]
+        dispatch.assert_not_called()
+
+    @pytest.mark.parametrize("patch_header", ["*** Add File:", "*** Update File:", "***Add File:", "***Update File:"])
+    def test_strict_mode_blocks_v4a_patch_inside_trusted_skills_store(
+        self,
+        tmp_path,
+        monkeypatch,
+        patch_header,
+    ):
+        agent = _make_strict_skill_agent(platform="cli")
+        skills_dir = tmp_path / "skills"
+        monkeypatch.setattr("tools.skill_manager_tool.SKILLS_DIR", skills_dir)
+        monkeypatch.setattr("agent.skill_utils.get_all_skills_dirs", lambda: [skills_dir])
+        monkeypatch.setenv("TERMINAL_CWD", str(tmp_path))
+        patch_text = f"{patch_header} skills/demo/SKILL.md\n+content\n"
+
+        with patch(
+            "run_agent.handle_function_call",
+            side_effect=AssertionError("strict skills store V4A patches should be blocked before dispatch"),
+        ) as dispatch:
+            result = agent._invoke_tool(
+                "patch",
+                {"mode": "patch", "patch": patch_text},
+                effective_task_id="session-1",
+                messages=[],
+            )
+
+        payload = json.loads(result)
+        assert payload["success"] is False
+        assert "New skills must use skill_manage(action='create')" in payload["error"]
+        dispatch.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "patch_text",
+        [
+            "*** Move File: skills/demo/SKILL.md -> archived/demo.md\n",
+            "*** Move File: workspace/notes.md -> skills/demo/references/notes.md\n",
+            "***Move File: skills/demo/SKILL.md -> archived/demo.md\n",
+            "***Move File: workspace/notes.md -> skills/demo/references/notes.md\n",
+        ],
+    )
+    def test_strict_mode_blocks_v4a_move_touching_trusted_skills_store(
+        self,
+        tmp_path,
+        monkeypatch,
+        patch_text,
+    ):
+        agent = _make_strict_skill_agent(platform="cli")
+        skills_dir = tmp_path / "skills"
+        monkeypatch.setattr("tools.skill_manager_tool.SKILLS_DIR", skills_dir)
+        monkeypatch.setattr("agent.skill_utils.get_all_skills_dirs", lambda: [skills_dir])
+        monkeypatch.setenv("TERMINAL_CWD", str(tmp_path))
+
+        with patch(
+            "run_agent.handle_function_call",
+            side_effect=AssertionError("strict skills store V4A moves should be blocked before dispatch"),
+        ) as dispatch:
+            result = agent._invoke_tool(
+                "patch",
+                {"mode": "patch", "patch": patch_text},
+                effective_task_id="session-1",
+                messages=[],
+            )
+
+        payload = json.loads(result)
+        assert payload["success"] is False
+        assert "Direct writes to trusted skill directories are blocked" in payload["error"]
+        dispatch.assert_not_called()
+
+    def test_strict_mode_blocks_write_file_inside_external_skill_dir(self, tmp_path, monkeypatch):
+        agent = _make_strict_skill_agent(platform="cli")
+        local_skills_dir = tmp_path / "local-skills"
+        external_skills_dir = tmp_path / "external-skills"
+        monkeypatch.setattr("tools.skill_manager_tool.SKILLS_DIR", local_skills_dir)
+        monkeypatch.setattr(
+            "agent.skill_utils.get_all_skills_dirs",
+            lambda: [local_skills_dir, external_skills_dir],
+        )
+
+        with patch(
+            "run_agent.handle_function_call",
+            side_effect=AssertionError("strict external skill writes should be blocked before dispatch"),
+        ) as dispatch:
+            result = agent._invoke_tool(
+                "write_file",
+                {"path": str(external_skills_dir / "demo" / "SKILL.md"), "content": "blocked"},
+                effective_task_id="session-1",
+                messages=[],
+            )
+
+        payload = json.loads(result)
+        assert payload["success"] is False
+        assert "Direct writes to trusted skill directories are blocked" in payload["error"]
+        dispatch.assert_not_called()
+
+    def test_strict_mode_blocks_v4a_patch_inside_external_skill_dir(self, tmp_path, monkeypatch):
+        agent = _make_strict_skill_agent(platform="cli")
+        local_skills_dir = tmp_path / "local-skills"
+        external_skills_dir = tmp_path / "external-skills"
+        monkeypatch.setattr("tools.skill_manager_tool.SKILLS_DIR", local_skills_dir)
+        monkeypatch.setattr(
+            "agent.skill_utils.get_all_skills_dirs",
+            lambda: [local_skills_dir, external_skills_dir],
+        )
+        monkeypatch.setenv("TERMINAL_CWD", str(tmp_path))
+        patch_text = "*** Add File: external-skills/demo/SKILL.md\n+content\n"
+
+        with patch(
+            "run_agent.handle_function_call",
+            side_effect=AssertionError("strict external skill patches should be blocked before dispatch"),
+        ) as dispatch:
+            result = agent._invoke_tool(
+                "patch",
+                {"mode": "patch", "patch": patch_text},
+                effective_task_id="session-1",
+                messages=[],
+            )
+
+        payload = json.loads(result)
+        assert payload["success"] is False
+        assert "Direct writes to trusted skill directories are blocked" in payload["error"]
+        dispatch.assert_not_called()
+
+    def test_strict_mode_allows_write_file_outside_trusted_skills_store(self, tmp_path, monkeypatch):
+        agent = _make_strict_skill_agent(platform="cli")
+        skills_dir = tmp_path / "skills"
+        monkeypatch.setattr("tools.skill_manager_tool.SKILLS_DIR", skills_dir)
+        monkeypatch.setattr("agent.skill_utils.get_all_skills_dirs", lambda: [skills_dir])
+        outside_path = tmp_path / "workspace" / "notes.md"
+
+        with patch("run_agent.handle_function_call", return_value='{"success": true}') as dispatch:
+            result = agent._invoke_tool(
+                "write_file",
+                {"path": str(outside_path), "content": "allowed"},
+                effective_task_id="session-1",
+                messages=[],
+            )
+
+        assert json.loads(result) == {"success": True}
+        dispatch.assert_called_once()
+
+    def test_non_terminal_strict_mode_allows_file_tool_inside_trusted_skills_store(self, tmp_path, monkeypatch):
+        agent = _make_strict_skill_agent(platform="telegram")
+        skills_dir = tmp_path / "skills"
+        monkeypatch.setattr("tools.skill_manager_tool.SKILLS_DIR", skills_dir)
+
+        with patch("run_agent.handle_function_call", return_value='{"success": true}') as dispatch:
+            result = agent._invoke_tool(
+                "write_file",
+                {"path": str(skills_dir / "demo" / "SKILL.md"), "content": "legacy"},
+                effective_task_id="session-1",
+                messages=[],
+            )
+
+        assert json.loads(result) == {"success": True}
+        dispatch.assert_called_once()
+
+    def test_strict_mode_stages_skill_manage_write_file_for_pending_candidate(self, tmp_path, monkeypatch):
+        from tools.skill_candidate_tool import create_candidate
+
+        agent = _make_strict_skill_agent(platform="cli")
+        candidates_dir = tmp_path / "skill-candidates"
+        skills_dir = tmp_path / "skills"
+        monkeypatch.setattr("tools.skill_candidate_tool.CANDIDATES_DIR", candidates_dir)
+        monkeypatch.setattr("tools.skill_manager_tool.SKILLS_DIR", skills_dir)
+        monkeypatch.setattr("agent.skill_utils.get_all_skills_dirs", lambda: [skills_dir])
+        created = create_candidate(
+            name="demo",
+            content="---\nname: demo\ndescription: desc\n---\n\n# Demo\n",
+            scope="general",
+            why_created="Useful workflow.",
+            verification_summary="Validated manually.",
+        )
+
+        with patch(
+            "run_agent.handle_function_call",
+            side_effect=AssertionError("pending candidate write_file should be staged before dispatch"),
+        ) as dispatch:
+            result = agent._invoke_tool(
+                "skill_manage",
+                {
+                    "action": "write_file",
+                    "name": "demo",
+                    "file_path": "references/notes.md",
+                    "file_content": "candidate notes",
+                },
+                effective_task_id="session-1",
+                messages=[],
+            )
+
+        payload = json.loads(result)
+        assert payload["success"] is True
+        assert payload["candidate_id"] == created["candidate_id"]
+        assert "will be installed when the candidate is approved" in payload["message"]
+        assert (
+            candidates_dir / created["candidate_id"] / "references" / "notes.md"
+        ).read_text(encoding="utf-8") == "candidate notes"
+        dispatch.assert_not_called()
+
+    def test_strict_mode_keeps_skill_manage_write_file_for_existing_skill(self, tmp_path, monkeypatch):
+        agent = _make_strict_skill_agent(platform="cli")
+        skills_dir = tmp_path / "skills"
+        skill_dir = skills_dir / "demo"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text(
+            "---\nname: demo\ndescription: desc\n---\n\n# Demo\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setattr("tools.skill_manager_tool.SKILLS_DIR", skills_dir)
+        monkeypatch.setattr("agent.skill_utils.get_all_skills_dirs", lambda: [skills_dir])
+
+        with patch("run_agent.handle_function_call", return_value='{"success": true}') as dispatch:
+            result = agent._invoke_tool(
+                "skill_manage",
+                {
+                    "action": "write_file",
+                    "name": "demo",
+                    "file_path": "references/notes.md",
+                    "file_content": "trusted notes",
+                },
+                effective_task_id="session-1",
+                messages=[],
+            )
+
+        assert json.loads(result) == {"success": True}
+        dispatch.assert_called_once()
+
+    @pytest.mark.parametrize("action", ["patch", "edit", "write_file"])
+    def test_strict_mode_allows_existing_skill_manage_edit_actions(self, action):
+        agent = _make_strict_skill_agent(platform="cli")
+        args = {"action": action, "name": "demo"}
+        if action == "edit":
+            args["content"] = "---\nname: demo\ndescription: desc\n---\n\n# Demo\n"
+        elif action == "patch":
+            args.update({"old_string": "old", "new_string": "new"})
+        else:
+            args.update({"file_path": "references/notes.md", "file_content": "notes"})
+
+        with patch("run_agent.handle_function_call", return_value='{"success": true}') as dispatch:
+            result = agent._invoke_tool(
+                "skill_manage",
+                args,
+                effective_task_id="session-1",
+                messages=[],
+            )
+
+        assert json.loads(result) == {"success": True}
+        dispatch.assert_called_once()
+
+    def test_strict_foreground_create_uses_draft_only_review_inputs(self):
+        with (
+            patch("run_agent.get_tool_definitions", return_value=_make_tool_defs("skill_manage")),
+            patch("run_agent.check_toolset_requirements", return_value={}),
+            patch("run_agent.OpenAI"),
+            patch(
+                "hermes_cli.config.load_config",
+                return_value={"skills": {"strict_creation_mode": True}},
+            ),
+        ):
+            agent = AIAgent(
+                api_key="test-k...7890",
+                base_url="https://openrouter.ai/api/v1",
+                quiet_mode=True,
+                skip_context_files=True,
+                skip_memory=True,
+            )
+
+        messages = [
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "function": {
+                            "name": "terminal",
+                            "arguments": json.dumps({"command": "pytest tests/test_run_agent.py -q"}),
+                        }
+                    }
+                ],
+            }
+        ]
+        function_args = {
+            "name": "demo",
+            "content": "---\nname: demo\ndescription: desc\n---\n\n# Demo\n",
+            "tool_calls": ["skill_view"],
+            "commands_run": ["make lint"],
+            "tests_run": ["pytest tests/test_other.py -q"],
+        }
+
+        with (
+            patch.object(
+                agent,
+                "_stage_skill_candidate",
+                return_value={"success": True, "candidate_id": "20260101_000000_abcdef12"},
+            ) as stage_candidate,
+            patch("tools.skill_candidate_tool.update_candidate_review", return_value={"success": True}),
+        ):
+            result = agent._handle_strict_skill_create_request(function_args)
+
+        assert json.loads(result)["success"] is True
+        kwargs = stage_candidate.call_args.kwargs
+        assert kwargs["origin"] == "user_requested"
+        assert kwargs["source_turn_range"] is None
+        assert kwargs["tool_calls"] == []
+        assert kwargs["commands_run"] == []
+        assert kwargs["tests_run"] == []
+        assert kwargs["scope"] == "general"
+        assert kwargs["why_created"] == "Captured from an explicit skill save request while strict creation mode is enabled."
+        assert (
+            kwargs["verification_summary"]
+            == "This proposal came from an explicit skill save request and still requires user review before promotion."
+        )
+        assert kwargs["reusability_rationale"] is None
+        assert kwargs["known_limits"] is None
+
+    def test_spawn_background_skill_patch_review_uses_patch_only_prompt(self):
+        with (
+            patch("run_agent.get_tool_definitions", return_value=_make_tool_defs("skill_manage")),
+            patch("run_agent.check_toolset_requirements", return_value={}),
+            patch("run_agent.OpenAI"),
+        ):
+            agent = AIAgent(
+                api_key="test-k...7890",
+                base_url="https://openrouter.ai/api/v1",
+                quiet_mode=True,
+                skip_context_files=True,
+                skip_memory=True,
+                platform="cli",
+            )
+
+        messages = [{"role": "user", "content": "hello"}]
+        with patch.object(agent, "_spawn_background_review") as spawn_background_review:
+            agent._spawn_background_skill_patch_review(messages)
+
+        spawn_background_review.assert_called_once_with(
+            messages_snapshot=messages,
+            prompt_override=agent._SKILL_PATCH_REVIEW_PROMPT,
+            thread_name="bg-skill-patch-review",
+        )
+
+    def test_background_review_agent_cannot_stage_user_requested_strict_create(self):
+        parent = _make_strict_skill_agent(platform="cli")
+        captured = {}
+
+        class _FakeReviewAgent(AIAgent):
+            def __init__(self, **kwargs):
+                self._session_messages = []
+
+            def _create_user_requested_skill_candidate(self, **kwargs):
+                raise AssertionError("background review create must not use explicit-save path")
+
+            def run_conversation(self, user_message, conversation_history):
+                captured["is_background_review_agent"] = getattr(
+                    self, "_is_background_review_agent", False
+                )
+                captured["result"] = json.loads(
+                    self._handle_strict_skill_create_request(
+                        {
+                            "name": "bad-background-create",
+                            "content": "---\nname: bad-background-create\ndescription: desc\n---\n\n# Demo\n",
+                        }
+                    )
+                )
+
+            def shutdown_memory_provider(self):
+                pass
+
+            def close(self):
+                pass
+
+        def _run_thread_immediately(*args, **kwargs):
+            return MagicMock(start=lambda: kwargs["target"]())
+
+        with (
+            patch("run_agent.AIAgent", _FakeReviewAgent),
+            patch("threading.Thread", side_effect=_run_thread_immediately),
+        ):
+            parent._spawn_background_review(
+                messages_snapshot=[],
+                prompt_override=parent._SKILL_PATCH_REVIEW_PROMPT,
+                thread_name="bg-skill-patch-review",
+            )
+
+        assert captured["is_background_review_agent"] is True
+        assert captured["result"]["success"] is False
+        assert "strict admission review path" in captured["result"]["error"]
+
+    def test_strict_skill_manage_create_ignores_hidden_review_metadata_fields(self):
+        with (
+            patch("run_agent.get_tool_definitions", return_value=_make_tool_defs("skill_manage")),
+            patch("run_agent.check_toolset_requirements", return_value={}),
+            patch("run_agent.OpenAI"),
+            patch(
+                "hermes_cli.config.load_config",
+                return_value={"skills": {"strict_creation_mode": True}},
+            ),
+        ):
+            agent = AIAgent(
+                api_key="test-k...7890",
+                base_url="https://openrouter.ai/api/v1",
+                quiet_mode=True,
+                skip_context_files=True,
+                skip_memory=True,
+            )
+
+        with (
+            patch.object(
+                agent,
+                "_stage_skill_candidate",
+                return_value={"success": True, "candidate_id": "20260101_000000_abcdef12"},
+            ) as stage_candidate,
+            patch("tools.skill_candidate_tool.update_candidate_review", return_value={"success": True}),
+        ):
+            result = agent._handle_strict_skill_create_request(
+                {
+                    "name": "demo",
+                    "content": "---\nname: demo\ndescription: desc\n---\n\n# Demo\n",
+                    "scope": "repo-specific",
+                    "why_created": "custom why",
+                    "verification_summary": "custom verification",
+                    "reusability_rationale": "custom rationale",
+                    "known_limits": "custom limits",
+                    "origin": "automatic_review",
+                }
+            )
+
+        assert json.loads(result)["success"] is True
+        kwargs = stage_candidate.call_args.kwargs
+        assert kwargs["origin"] == "user_requested"
+        assert kwargs["scope"] == "general"
+        assert kwargs["why_created"] == "Captured from an explicit skill save request while strict creation mode is enabled."
+        assert (
+            kwargs["verification_summary"]
+            == "This proposal came from an explicit skill save request and still requires user review before promotion."
+        )
+        assert kwargs["source_turn_range"] is None
+        assert kwargs["tool_calls"] == []
+        assert kwargs["commands_run"] == []
+        assert kwargs["tests_run"] == []
+        assert kwargs["reusability_rationale"] is None
+        assert kwargs["known_limits"] is None
+
+    def test_strict_foreground_create_skips_admission_and_queues_manual_review(self, agent, tmp_path):
+        from tools.skill_candidate_tool import list_candidates, view_candidate
+
+        candidates_dir = tmp_path / "skill-candidates"
+        content = "---\nname: explicit-demo\ndescription: desc\n---\n\n# Demo\n"
+
+        with (
+            patch("tools.skill_candidate_tool.CANDIDATES_DIR", candidates_dir),
+            patch("agent.skill_admission.run_admission_review", side_effect=AssertionError("explicit saves skip admission")),
+        ):
+            result = json.loads(
+                agent._handle_strict_skill_create_request(
+                    {
+                        "name": "explicit-demo",
+                        "content": content,
+                    }
+                )
+            )
+            candidate = view_candidate(result["candidate_id"])["candidate"]
+            pending = list_candidates(pending_only=True)
+
+        assert result["success"] is True
+        assert result["decision"] == "promote_new"
+        assert candidate["status"] == "reviewed"
+        assert candidate["origin"] == "user_requested"
+        assert candidate["source_turn_range"] == []
+        assert candidate["tool_calls"] == []
+        assert candidate["commands_run"] == []
+        assert candidate["tests_run"] == []
+        assert candidate["review"]["decision"] == "promote_new"
+        assert candidate["review"]["threshold_used"] == 0
+        assert pending["count"] == 1
+
+    def test_create_automatic_skill_candidate_and_review_rolls_back_candidate_on_review_exception(self, agent, tmp_path):
+        candidates_dir = tmp_path / "skill-candidates"
+        content = "---\nname: demo\ndescription: desc\n---\n\n# Demo\n"
+
+        with (
+            patch("tools.skill_candidate_tool.CANDIDATES_DIR", candidates_dir),
+            patch.object(agent, "_review_skill_candidate", side_effect=RuntimeError("admission timeout")),
+        ):
+            result = agent._create_automatic_skill_candidate_and_review(
+                name="demo",
+                content=content,
+                category=None,
+                scope="general",
+                why_created="Explicit skill save request.",
+                verification_summary="Validated manually.",
+            )
+
+        assert result["success"] is False
+        assert "admission timeout" in result["error"]
+        assert not candidates_dir.exists() or not any(candidates_dir.iterdir())
+
+    def test_create_automatic_skill_candidate_and_review_rolls_back_candidate_on_review_failure(self, agent, tmp_path):
+        candidates_dir = tmp_path / "skill-candidates"
+        content = "---\nname: demo\ndescription: desc\n---\n\n# Demo\n"
+
+        with (
+            patch("tools.skill_candidate_tool.CANDIDATES_DIR", candidates_dir),
+            patch.object(
+                agent,
+                "_review_skill_candidate",
+                return_value={"success": False, "error": "review transport failed"},
+            ),
+        ):
+            result = agent._create_automatic_skill_candidate_and_review(
+                name="demo",
+                content=content,
+                category=None,
+                scope="general",
+                why_created="Explicit skill save request.",
+                verification_summary="Validated manually.",
+            )
+
+        assert result == {"success": False, "error": "review transport failed"}
+        assert not candidates_dir.exists() or not any(candidates_dir.iterdir())
+
+    def test_create_automatic_skill_candidate_and_review_returns_failure_on_review_reject(self, agent, tmp_path):
+        candidates_dir = tmp_path / "skill-candidates"
+        content = "---\nname: demo\ndescription: desc\n---\n\n# Demo\n"
+
+        with (
+            patch("tools.skill_candidate_tool.CANDIDATES_DIR", candidates_dir),
+            patch.object(
+                agent,
+                "_review_skill_candidate",
+                return_value={
+                    "success": True,
+                    "decision": "reject",
+                    "decision_reason": "Below threshold.",
+                },
+            ),
+        ):
+            result = agent._create_automatic_skill_candidate_and_review(
+                name="demo",
+                content=content,
+                category=None,
+                scope="general",
+                why_created="Explicit skill save request.",
+                verification_summary="Validated manually.",
+            )
+
+        assert result["success"] is False
+        assert result["decision"] == "reject"
+        assert result["decision_reason"] == "Below threshold."
+        assert "reviewed and rejected" in result["message"]
+
+    def test_create_automatic_skill_candidate_and_review_rejects_duplicate_skill_name_before_review(self, agent, tmp_path):
+        candidates_dir = tmp_path / "skill-candidates"
+        skills_dir = tmp_path / "skills"
+        content = "---\nname: demo\ndescription: desc\n---\n\n# Demo\n"
+        existing_dir = skills_dir / "demo"
+        existing_dir.mkdir(parents=True, exist_ok=True)
+        (existing_dir / "SKILL.md").write_text(content, encoding="utf-8")
+
+        with (
+            patch("tools.skill_candidate_tool.CANDIDATES_DIR", candidates_dir),
+            patch("tools.skill_manager_tool.SKILLS_DIR", skills_dir),
+            patch("agent.skill_utils.get_all_skills_dirs", return_value=[skills_dir]),
+            patch.object(agent, "_review_skill_candidate", side_effect=AssertionError("duplicate names should fail before review")),
+        ):
+            result = agent._create_automatic_skill_candidate_and_review(
+                name="demo",
+                content=content,
+                category=None,
+                scope="general",
+                why_created="Explicit skill save request.",
+                verification_summary="Validated manually.",
+            )
+
+        assert result["success"] is False
+        assert "already exists at" in result["error"]
+        assert not candidates_dir.exists() or not any(candidates_dir.iterdir())
+
+    def test_create_automatic_skill_candidate_and_review_rejects_duplicate_live_candidate_before_review(self, agent, tmp_path):
+        from tools.skill_candidate_tool import create_candidate
+
+        candidates_dir = tmp_path / "skill-candidates"
+        content = "---\nname: demo\ndescription: desc\n---\n\n# Demo\n"
+
+        with (
+            patch("tools.skill_candidate_tool.CANDIDATES_DIR", candidates_dir),
+            patch.object(agent, "_review_skill_candidate", side_effect=AssertionError("duplicate live candidates should fail before review")),
+        ):
+            created = create_candidate(
+                name="demo",
+                content=content,
+                scope="general",
+                why_created="Useful workflow.",
+                verification_summary="Validated manually.",
+            )
+            assert created["success"] is True
+
+            result = agent._create_automatic_skill_candidate_and_review(
+                name="demo",
+                content=content,
+                category=None,
+                scope="general",
+                why_created="Explicit skill save request.",
+                verification_summary="Validated manually.",
+            )
+
+        assert result["success"] is False
+        assert "pending skill candidate named 'demo' already exists" in result["error"]
+        candidate_dirs = [p for p in candidates_dir.iterdir() if p.is_dir()]
+        assert len(candidate_dirs) == 1
 
 class TestToolUseEnforcementConfig:
     """Tests for the agent.tool_use_enforcement config option."""
@@ -2046,6 +2938,61 @@ class TestConcurrentToolExecution:
         assert messages[0]["role"] == "tool"
         assert json.loads(messages[0]["content"]) == {"error": "Blocked by policy"}
 
+    def test_sequential_strict_skill_store_block_skips_checkpoints_and_dispatch(self, tmp_path, monkeypatch):
+        agent = _make_strict_skill_agent(platform="cli")
+        skills_dir = tmp_path / "skills"
+        monkeypatch.setattr("tools.skill_manager_tool.SKILLS_DIR", skills_dir)
+        monkeypatch.setattr("agent.skill_utils.get_all_skills_dirs", lambda: [skills_dir])
+        tool_call = _mock_tool_call(
+            name="write_file",
+            arguments=json.dumps({"path": str(skills_dir / "demo" / "SKILL.md"), "content": "blocked"}),
+            call_id="c1",
+        )
+        mock_msg = _mock_assistant_msg(content="", tool_calls=[tool_call])
+        messages = []
+
+        agent._checkpoint_mgr.enabled = True
+        agent._checkpoint_mgr.ensure_checkpoint = MagicMock(
+            side_effect=AssertionError("checkpoint should not run")
+        )
+        starts = []
+        agent.tool_start_callback = lambda *a: starts.append(a)
+
+        with patch("run_agent.handle_function_call", side_effect=AssertionError("should not run")):
+            agent._execute_tool_calls_sequential(mock_msg, messages, "task-1")
+
+        agent._checkpoint_mgr.ensure_checkpoint.assert_not_called()
+        assert starts == []
+        assert len(messages) == 1
+        assert "Direct writes to trusted skill directories are blocked" in json.loads(messages[0]["content"])["error"]
+
+    def test_concurrent_strict_skill_store_block_skips_preflight_checkpoint(self, tmp_path, monkeypatch):
+        agent = _make_strict_skill_agent(platform="cli")
+        skills_dir = tmp_path / "skills"
+        monkeypatch.setattr("tools.skill_manager_tool.SKILLS_DIR", skills_dir)
+        monkeypatch.setattr("agent.skill_utils.get_all_skills_dirs", lambda: [skills_dir])
+        tool_call = _mock_tool_call(
+            name="write_file",
+            arguments=json.dumps({"path": str(skills_dir / "demo" / "SKILL.md"), "content": "blocked"}),
+            call_id="c1",
+        )
+        mock_msg = _mock_assistant_msg(content="", tool_calls=[tool_call])
+        messages = []
+
+        agent._checkpoint_mgr.enabled = True
+        agent._checkpoint_mgr.ensure_checkpoint = MagicMock(
+            side_effect=AssertionError("checkpoint should not run")
+        )
+
+        with patch("run_agent.handle_function_call", side_effect=AssertionError("should not run")):
+            agent._execute_tool_calls_concurrent(mock_msg, messages, "task-1")
+
+        agent._checkpoint_mgr.ensure_checkpoint.assert_not_called()
+        assert len(messages) == 1
+        payload = json.loads(messages[0]["content"])
+        assert payload["success"] is False
+        assert "Direct writes to trusted skill directories are blocked" in payload["error"]
+
     def test_blocked_memory_tool_does_not_reset_counter(self, agent, monkeypatch):
         """Blocked memory tool should not reset the nudge counter."""
         agent._turns_since_memory = 5
@@ -2189,6 +3136,274 @@ class TestRunConversation:
             result = agent.run_conversation("hello")
         assert result["final_response"] == "Final answer"
         assert result["completed"] is True
+
+    def test_cli_strict_skill_nudge_spawns_patch_review_and_candidate_review(self):
+        with (
+            patch("run_agent.get_tool_definitions", return_value=_make_tool_defs("skill_manage")),
+            patch("run_agent.check_toolset_requirements", return_value={}),
+            patch("run_agent.OpenAI"),
+            patch(
+                "hermes_cli.config.load_config",
+                return_value={"skills": {"strict_creation_mode": True}},
+            ),
+        ):
+            agent = AIAgent(
+                api_key="test-k...7890",
+                base_url="https://openrouter.ai/api/v1",
+                quiet_mode=True,
+                skip_context_files=True,
+                skip_memory=True,
+                platform="cli",
+            )
+        self._setup_agent(agent)
+        agent.client.chat.completions.create.return_value = _mock_response(content="Final answer", finish_reason="stop")
+        agent._skill_nudge_interval = 1
+        agent._iters_since_skill = 1
+        agent._memory_nudge_interval = 0
+
+        with (
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+            patch.object(agent, "_spawn_background_review") as legacy_background_review,
+            patch.object(agent, "_spawn_background_skill_patch_review") as patch_review,
+            patch.object(agent, "_spawn_strict_skill_background_review") as strict_review,
+        ):
+            result = agent.run_conversation("hello")
+
+        assert result["completed"] is True
+        patch_review.assert_called_once()
+        strict_review.assert_called_once()
+        legacy_background_review.assert_not_called()
+
+    def test_tui_strict_skill_nudge_spawns_patch_review_and_candidate_review(self):
+        with (
+            patch("run_agent.get_tool_definitions", return_value=_make_tool_defs("skill_manage")),
+            patch("run_agent.check_toolset_requirements", return_value={}),
+            patch("run_agent.OpenAI"),
+            patch(
+                "hermes_cli.config.load_config",
+                return_value={"skills": {"strict_creation_mode": True}},
+            ),
+        ):
+            agent = AIAgent(
+                api_key="test-k...7890",
+                base_url="https://openrouter.ai/api/v1",
+                quiet_mode=True,
+                skip_context_files=True,
+                skip_memory=True,
+                platform="tui",
+            )
+        self._setup_agent(agent)
+        agent.client.chat.completions.create.return_value = _mock_response(content="Final answer", finish_reason="stop")
+        agent._skill_nudge_interval = 1
+        agent._iters_since_skill = 1
+        agent._memory_nudge_interval = 0
+
+        with (
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+            patch.object(agent, "_spawn_background_review") as legacy_background_review,
+            patch.object(agent, "_spawn_background_skill_patch_review") as patch_review,
+            patch.object(agent, "_spawn_strict_skill_background_review") as strict_review,
+        ):
+            result = agent.run_conversation("hello")
+
+        assert result["completed"] is True
+        patch_review.assert_called_once()
+        strict_review.assert_called_once()
+        legacy_background_review.assert_not_called()
+
+    def test_strict_background_skill_review_callback_is_actionable(self):
+        with (
+            patch("run_agent.get_tool_definitions", return_value=_make_tool_defs("skill_manage")),
+            patch("run_agent.check_toolset_requirements", return_value={}),
+            patch("run_agent.OpenAI"),
+        ):
+            agent = AIAgent(
+                api_key="test-k...7890",
+                base_url="https://openrouter.ai/api/v1",
+                quiet_mode=True,
+                skip_context_files=True,
+                skip_memory=True,
+                platform="tui",
+            )
+
+        generated = {
+            "success": True,
+            "created": True,
+            "name": "pytest-subset-rerun",
+            "content": "---\nname: pytest-subset-rerun\ndescription: desc\n---\n\n# Body\n",
+            "category": "",
+            "scope": "repo-specific",
+            "why_created": "Useful workflow.",
+            "reusability_rationale": "",
+            "known_limits": "",
+            "verification_summary": "Validated with pytest.",
+            "tool_calls": ["terminal"],
+            "commands_run": ["pytest tests/test_model_tools.py -q"],
+            "tests_run": ["pytest tests/test_model_tools.py -q"],
+        }
+        agent.background_review_callback = MagicMock()
+
+        with (
+            patch("agent.skill_admission.maybe_generate_automatic_candidate", return_value=generated),
+            patch.object(
+                agent,
+                "_create_automatic_skill_candidate_and_review",
+                return_value={
+                    "success": True,
+                    "decision": "promote_new",
+                    "candidate_id": "cand-123",
+                },
+            ),
+            patch("threading.Thread") as mock_thread,
+        ):
+            target = None
+
+            def _capture_thread(*args, **kwargs):
+                nonlocal target
+                target = kwargs["target"]
+                return MagicMock(start=lambda: target())
+
+            mock_thread.side_effect = _capture_thread
+            agent._spawn_strict_skill_background_review(messages_snapshot=[])
+
+        agent.background_review_callback.assert_called_once_with(
+            "Skill proposal 'pytest-subset-rerun' is pending review. "
+            "Review with /skillreviews approve cand-123 or /skillreviews reject cand-123."
+        )
+
+    def test_review_skill_candidate_passes_live_main_runtime(self):
+        with (
+            patch("run_agent.get_tool_definitions", return_value=_make_tool_defs("skill_manage")),
+            patch("run_agent.check_toolset_requirements", return_value={}),
+            patch("run_agent.OpenAI"),
+        ):
+            agent = AIAgent(
+                model="gpt-5.4",
+                provider="openai-codex",
+                api_key="codex-token",
+                base_url="https://chatgpt.com/backend-api/codex",
+                api_mode="codex_responses",
+                quiet_mode=True,
+                skip_context_files=True,
+                skip_memory=True,
+                platform="cli",
+            )
+
+        candidate = {
+            "origin": "automatic_review",
+            "proposed_name": "pytest-subset-rerun",
+            "skill_content": "---\nname: pytest-subset-rerun\ndescription: desc\n---\n\n# Body\n",
+        }
+        verdict = {
+            "decision": "promote_new",
+            "decision_reason": "Strong enough.",
+            "summary_for_user": "Save it.",
+            "scores": {"reusability": 1},
+            "total_score": 7,
+            "threshold_used": 7,
+        }
+
+        with (
+            patch("tools.skill_candidate_tool.view_candidate", return_value={"success": True, "candidate": candidate}),
+            patch("tools.skill_candidate_tool.update_candidate_review", return_value={"success": True}),
+            patch("agent.skill_admission.run_admission_review", return_value=verdict) as mock_review,
+        ):
+            result = agent._review_skill_candidate("cand-123")
+
+        assert result["success"] is True
+        assert mock_review.call_args.kwargs["main_runtime"] == {
+            "model": "gpt-5.4",
+            "provider": "openai-codex",
+            "base_url": "https://chatgpt.com/backend-api/codex",
+            "api_key": "codex-token",
+            "api_mode": "codex_responses",
+        }
+
+    def test_strict_background_skill_review_passes_live_main_runtime(self):
+        with (
+            patch("run_agent.get_tool_definitions", return_value=_make_tool_defs("skill_manage")),
+            patch("run_agent.check_toolset_requirements", return_value={}),
+            patch("run_agent.OpenAI"),
+        ):
+            agent = AIAgent(
+                model="gpt-5.4",
+                provider="openai-codex",
+                api_key="codex-token",
+                base_url="https://chatgpt.com/backend-api/codex",
+                api_mode="codex_responses",
+                quiet_mode=True,
+                skip_context_files=True,
+                skip_memory=True,
+                platform="tui",
+            )
+
+        generated = {"success": True, "created": False, "reason": "reviewer opted out"}
+
+        with (
+            patch("agent.skill_admission.maybe_generate_automatic_candidate", return_value=generated) as mock_generate,
+            patch("threading.Thread") as mock_thread,
+        ):
+            target = None
+
+            def _capture_thread(*args, **kwargs):
+                nonlocal target
+                target = kwargs["target"]
+                return MagicMock(start=lambda: target())
+
+            mock_thread.side_effect = _capture_thread
+            agent._spawn_strict_skill_background_review(messages_snapshot=[])
+
+        assert mock_generate.call_args.kwargs["main_runtime"] == {
+            "model": "gpt-5.4",
+            "provider": "openai-codex",
+            "base_url": "https://chatgpt.com/backend-api/codex",
+            "api_key": "codex-token",
+            "api_mode": "codex_responses",
+        }
+
+    def test_non_terminal_strict_skill_nudge_keeps_legacy_background_review(self):
+        with (
+            patch("run_agent.get_tool_definitions", return_value=_make_tool_defs("skill_manage")),
+            patch("run_agent.check_toolset_requirements", return_value={}),
+            patch("run_agent.OpenAI"),
+            patch(
+                "hermes_cli.config.load_config",
+                return_value={"skills": {"strict_creation_mode": True}},
+            ),
+        ):
+            agent = AIAgent(
+                api_key="test-k...7890",
+                base_url="https://openrouter.ai/api/v1",
+                quiet_mode=True,
+                skip_context_files=True,
+                skip_memory=True,
+                platform="telegram",
+            )
+        self._setup_agent(agent)
+        agent.client.chat.completions.create.return_value = _mock_response(content="Final answer", finish_reason="stop")
+        agent._skill_nudge_interval = 1
+        agent._iters_since_skill = 1
+        agent._memory_nudge_interval = 0
+
+        with (
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+            patch.object(agent, "_spawn_background_review") as legacy_background_review,
+            patch.object(agent, "_spawn_background_skill_patch_review") as patch_review,
+            patch.object(agent, "_spawn_strict_skill_background_review") as strict_review,
+        ):
+            result = agent.run_conversation("hello")
+
+        assert result["completed"] is True
+        patch_review.assert_not_called()
+        strict_review.assert_not_called()
+        legacy_background_review.assert_called_once()
+        assert legacy_background_review.call_args.kwargs["review_skills"] is True
 
     def test_tool_calls_then_stop(self, agent):
         self._setup_agent(agent)

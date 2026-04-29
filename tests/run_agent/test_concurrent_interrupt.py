@@ -72,6 +72,11 @@ def _make_agent(monkeypatch):
         def _has_stream_consumers(self):
             return False
 
+        def _strict_skill_store_write_block_message(
+            self, function_name, function_args, task_id=None
+        ):
+            return None
+
     stub = _Stub()
     # Bind the real methods under test
     stub._execute_tool_calls_concurrent = _ra.AIAgent._execute_tool_calls_concurrent.__get__(stub)
@@ -261,4 +266,3 @@ def test_clear_interrupt_clears_worker_tids(monkeypatch):
         "clear_interrupt() did not clear the interrupt bit for a tracked "
         "worker tid — stale interrupt can leak into the next turn"
     )
-

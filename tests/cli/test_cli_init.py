@@ -160,6 +160,245 @@ class TestSingleQueryState:
         assert hasattr(cli, "_pending_input")
 
 
+class TestStrictSkillReviewQueue:
+    VALID_SKILL_CONTENT = """\
+---
+name: demo-skill
+description: Demo skill.
+---
+
+# Demo
+
+1. Do the thing.
+"""
+
+    def _candidate_dirs(self, tmp_path):
+        candidates_dir = tmp_path / "skill-candidates"
+        skills_dir = tmp_path / "skills"
+        return candidates_dir, skills_dir
+
+    def test_poll_pending_skill_review_candidates_enqueues_reviewed_candidate(self, tmp_path):
+        from tools.skill_candidate_tool import (
+            DECISION_PROMOTE_NEW,
+            STATUS_REVIEWED,
+            create_candidate,
+            update_candidate_review,
+        )
+
+        cli = _make_cli(config_overrides={"skills": {"strict_creation_mode": True}})
+        candidates_dir, skills_dir = self._candidate_dirs(tmp_path)
+        with (
+            patch("tools.skill_candidate_tool.CANDIDATES_DIR", candidates_dir),
+            patch("tools.skill_manager_tool.SKILLS_DIR", skills_dir),
+            patch("agent.skill_utils.get_all_skills_dirs", return_value=[skills_dir]),
+        ):
+            created = create_candidate(
+                name="demo-skill",
+                content=self.VALID_SKILL_CONTENT,
+                scope="repo-specific",
+                why_created="Useful workflow.",
+                verification_summary="Ran targeted tests successfully.",
+            )
+            update_candidate_review(
+                created["candidate_id"],
+                scores={
+                    "reusability": 2,
+                    "verification": 1,
+                    "non_triviality": 1,
+                    "scope_quality": 1,
+                    "actionability": 1,
+                },
+                total_score=6,
+                threshold_used=4,
+                decision=DECISION_PROMOTE_NEW,
+                decision_reason="Looks good.",
+                summary_for_user="Save this as a reusable workflow.",
+                status=STATUS_REVIEWED,
+            )
+
+            cli._poll_pending_skill_review_candidates()
+
+        assert created["candidate_id"] in cli._pending_skill_review_ids
+
+    def test_skillreviews_view_shows_staged_skill_content(self, tmp_path):
+        import cli as cli_mod
+        from tools.skill_candidate_tool import create_candidate, write_candidate_file
+
+        cli = _make_cli(config_overrides={"skills": {"strict_creation_mode": True}})
+        candidates_dir, skills_dir = self._candidate_dirs(tmp_path)
+        with (
+            patch("tools.skill_candidate_tool.CANDIDATES_DIR", candidates_dir),
+            patch("tools.skill_manager_tool.SKILLS_DIR", skills_dir),
+            patch("agent.skill_utils.get_all_skills_dirs", return_value=[skills_dir]),
+        ):
+            created = create_candidate(
+                name="demo-skill",
+                content=self.VALID_SKILL_CONTENT,
+                scope="repo-specific",
+                why_created="Useful workflow.",
+                verification_summary="Ran targeted tests successfully.",
+            )
+            write_candidate_file(created["candidate_id"], "references/notes.md", "notes")
+
+            printed = []
+            with patch.object(cli_mod, "_cprint", side_effect=printed.append):
+                cli._handle_skillreviews_command(f"/skillreviews view {created['candidate_id']}")
+
+        output = "\n".join(str(line) for line in printed)
+        assert "Skill proposal: demo-skill" in output
+        assert f"Candidate ID: {created['candidate_id']}" in output
+        assert str(candidates_dir / created["candidate_id"]) in output
+        assert "Staged supporting files:" in output
+        assert "references/notes.md" in output
+        assert "--- SKILL.md ---" in output
+        assert "# Demo" in output
+        assert "1. Do the thing." in output
+
+    def test_skillreviews_view_truncates_long_staged_skill_content(self, tmp_path):
+        import cli as cli_mod
+        from tools.skill_candidate_tool import create_candidate
+
+        cli = _make_cli(config_overrides={"skills": {"strict_creation_mode": True}})
+        candidates_dir, skills_dir = self._candidate_dirs(tmp_path)
+        long_content = (
+            "---\nname: demo-skill\ndescription: Demo skill.\n---\n\n"
+            + "\n".join(f"line {idx}" for idx in range(1, 130))
+        )
+        with (
+            patch("tools.skill_candidate_tool.CANDIDATES_DIR", candidates_dir),
+            patch("tools.skill_manager_tool.SKILLS_DIR", skills_dir),
+            patch("agent.skill_utils.get_all_skills_dirs", return_value=[skills_dir]),
+        ):
+            created = create_candidate(
+                name="demo-skill",
+                content=long_content,
+                scope="repo-specific",
+                why_created="Useful workflow.",
+                verification_summary="Ran targeted tests successfully.",
+            )
+
+            printed = []
+            with patch.object(cli_mod, "_cprint", side_effect=printed.append):
+                cli._handle_skillreviews_command(f"/skillreviews view {created['candidate_id']}")
+
+        output = "\n".join(str(line) for line in printed)
+        assert "line 95" in output
+        assert "line 101" not in output
+        assert "truncated after 100 lines" in output
+        assert str(candidates_dir / created["candidate_id"] / "SKILL.md") in output
+
+    def test_skillreviews_approve_promotes_candidate(self, tmp_path):
+        from tools.skill_candidate_tool import (
+            DECISION_PROMOTE_NEW,
+            STATUS_REVIEWED,
+            create_candidate,
+            update_candidate_review,
+        )
+
+        cli = _make_cli(config_overrides={"skills": {"strict_creation_mode": True}})
+        candidates_dir, skills_dir = self._candidate_dirs(tmp_path)
+        with (
+            patch("tools.skill_candidate_tool.CANDIDATES_DIR", candidates_dir),
+            patch("tools.skill_manager_tool.SKILLS_DIR", skills_dir),
+            patch("agent.skill_utils.get_all_skills_dirs", return_value=[skills_dir]),
+            patch("agent.prompt_builder.clear_skills_system_prompt_cache"),
+        ):
+            created = create_candidate(
+                name="demo-skill",
+                content=self.VALID_SKILL_CONTENT,
+                scope="repo-specific",
+                why_created="Useful workflow.",
+                verification_summary="Ran targeted tests successfully.",
+            )
+            update_candidate_review(
+                created["candidate_id"],
+                scores={
+                    "reusability": 2,
+                    "verification": 1,
+                    "non_triviality": 1,
+                    "scope_quality": 1,
+                    "actionability": 1,
+                },
+                total_score=6,
+                threshold_used=4,
+                decision=DECISION_PROMOTE_NEW,
+                decision_reason="Looks good.",
+                summary_for_user="Save this as a reusable workflow.",
+                status=STATUS_REVIEWED,
+            )
+
+            cli._handle_skillreviews_command(f"/skillreviews approve {created['candidate_id']}")
+
+        assert (skills_dir / "demo-skill" / "SKILL.md").exists()
+
+    def test_skillreviews_approve_refreshes_skill_command_cache(self, tmp_path):
+        import cli as cli_mod
+        from tools.skill_candidate_tool import (
+            DECISION_PROMOTE_NEW,
+            STATUS_REVIEWED,
+            create_candidate,
+            update_candidate_review,
+        )
+
+        cli = _make_cli(config_overrides={"skills": {"strict_creation_mode": True}})
+        candidates_dir, skills_dir = self._candidate_dirs(tmp_path)
+        with (
+            patch("tools.skill_candidate_tool.CANDIDATES_DIR", candidates_dir),
+            patch("tools.skill_manager_tool.SKILLS_DIR", skills_dir),
+            patch("agent.skill_utils.get_all_skills_dirs", return_value=[skills_dir]),
+            patch("agent.prompt_builder.clear_skills_system_prompt_cache"),
+        ):
+            created = create_candidate(
+                name="demo-skill",
+                content=self.VALID_SKILL_CONTENT,
+                scope="repo-specific",
+                why_created="Useful workflow.",
+                verification_summary="Ran targeted tests successfully.",
+            )
+            update_candidate_review(
+                created["candidate_id"],
+                scores={
+                    "reusability": 2,
+                    "verification": 1,
+                    "non_triviality": 1,
+                    "scope_quality": 1,
+                    "actionability": 1,
+                },
+                total_score=6,
+                threshold_used=4,
+                decision=DECISION_PROMOTE_NEW,
+                decision_reason="Looks good.",
+                summary_for_user="Save this as a reusable workflow.",
+                status=STATUS_REVIEWED,
+            )
+
+            cli_mod._skill_commands = {}
+            refreshed = {"/demo-skill": {"name": "demo-skill"}}
+            with patch.object(cli_mod, "scan_skill_commands", return_value=refreshed) as mock_scan:
+                cli._handle_skillreviews_command(f"/skillreviews approve {created['candidate_id']}")
+
+        mock_scan.assert_called_once()
+        assert cli_mod._skill_commands == refreshed
+
+    def test_skillreviews_approve_reports_promotion_exception(self):
+        cli = _make_cli(config_overrides={"skills": {"strict_creation_mode": True}})
+
+        printed = []
+        globals_to_patch = cli._handle_skillreviews_command.__globals__
+        mock_scan = MagicMock()
+        with (
+            patch("tools.skill_candidate_tool.view_candidate", return_value={"success": True}),
+            patch("tools.skill_candidate_tool.promote_candidate", side_effect=OSError("disk full")),
+            patch.dict(globals_to_patch, {"_cprint": printed.append, "scan_skill_commands": mock_scan}),
+        ):
+            cli._handle_skillreviews_command("/skillreviews approve cand-123")
+
+        mock_scan.assert_not_called()
+        assert "Could not promote candidate: disk full" in "\n".join(
+            str(line) for line in printed
+        )
+
+
 class TestHistoryDisplay:
     def test_history_numbers_only_visible_messages_and_summarizes_tools(self, capsys):
         cli = _make_cli()
